@@ -1,0 +1,659 @@
+---
+title: "Fig1"
+author: "Eladio J Marquez"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list = ls())
+
+library(pals)
+library(scales)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+library(cowplot)
+library(grid)
+library(gridExtra)
+library(gtable)
+library(tibble)
+library(reshape2)
+library(dplyr)
+
+# Loads ATAC data
+peak.set = "narrow"
+run.name="AgexSex_homo" # Age|AgexSex|AgexSex_homo
+batch.variable="batchdate" # batchdate|rebatch
+
+atac_stats <- load(paste0("./data-repo/aging.summer2017_filtered_global.stats_",peak.set,"Peaks_filtered.RData"))
+atac_data <- load(paste0("./data-repo/pbmc_aging.summer2017_",peak.set,"Peaks_filtered.RData"))
+atacseq <- new.env()
+da_output <- load(paste0("./data-repo/da_output_",run.name,"_",batch.variable,"_",peak.set,"Peaks","_BySex.RData"),envir = atacseq)
+adj.data.atac <- lapply(lapply(atacseq$da_bysex,`[[`,"da.list"),`[[`,"adj")
+
+adj.data.atac <- lapply(lapply(atacseq$da_bysex,`[[`,"da.list"),`[[`,"adj")[[1]] %>%
+  data.frame(.) %>%
+  rownames_to_column("peakco") %>%
+  inner_join(atac.allpeaks.anno.pbmc,.,by="peakco")
+
+# Expression data
+rna_data <- load("./data-repo/pbmc_aging.summer2017_RNA_filtered.RData")
+rnaseq <- new.env()
+rna_stats <- load(paste0("./data-repo/aging.summer2017_filtered_global.stats_RNA_filtered.RData"),envir = rnaseq)
+da_output.rna <- load(paste0("./data-repo/da_output_",run.name,"_",batch.variable,"_RNA_BySex.RData"),envir = rnaseq)
+adj.data.rna <- lapply(lapply(rnaseq$da_bysex,`[[`,"da.list"),`[[`,"adj")[[1]] %>%
+  data.frame(.) %>%
+  rownames_to_column("EnsemblID") %>%
+  inner_join(anno.rna.pbmc,.,by="EnsemblID")
+
+# Global parameters
+fdr.thresh = 0.05
+fdr.thresh.rna = 0.1
+pflank = 2000
+min.expressed = 3
+geneset.path = "./data-repo/geneset.info.RData"
+min.modgenes = 5
+gene.uni <- sort(unique((expressed.pbmc %>% mutate(EnsemblID=rownames(.)) %>% filter(Total.counts>=min.expressed) %>% inner_join(anno.rna.pbmc,by="EnsemblID"))$GeneName))
+pcstd_cutoff = 0.25
+fdr.thresh.enrichtest = 0.05
+focus.celltypes <- c("PBMC","CD14","CD56","CD19","CD4_naive","CD4_memory","CD8_naive","CD8_memory")
+
+# Load annotation gene sets
+gsenv = new.env() 
+genesets <- load(geneset.path,envir = gsenv)
+
+# External+helper scripts
+source("./scripts/modules.enrichtest.R")
+source("./scripts/module_test_functions.R")
+source("./scripts/grafx_functions.R")
+source("./scripts/da_bypeakset.R")
+source("./scripts/ms_colors.R")
+
+```
+
+# Figure 1B. Principal component analysis
+
+```{r fig1b_pca, fig.asp=1}
+
+# ATAC
+atac_pca.fname = "data-repo/atac.pca.RData"
+
+if (atac_pca.fname %in% dir(recursive = T)) {
+  atac_pca_data <- load(atac_pca.fname,envir = atacseq)
+} else {
+  atacseq$Vall <- prcomp(t(adj.data.atac %>% column_to_rownames("peakco") %>% select(samps)),scale. = T)
+  atacseq$Vall$npcs = 5
+  atacseq$Vall$pcvarp <- (100*(atacseq$Vall$sdev)^2/sum((atacseq$Vall$sdev)^2))[1:atacseq$Vall$npcs]
+  atacseq$Vall$pcdata <- data.frame(atacseq$Vall$x)[,1:atacseq$Vall$npcs] %>%
+    mutate(sampid=rownames(.),
+           PC2=-PC2,
+           PC4=-PC4,
+           PC5=-PC5) %>%
+    inner_join(data.frame(sampid,sex,age.group,batchdate,nreps,stringsAsFactors = F),by="sampid")
+  atacseq$Vall$rotation[,c(2,4,5)] <- -atacseq$Vall$rotation[,c(2,4,5)]
+  atacseq$Vall$pcstats <- melt(atacseq$Vall$pcdata,id.vars = c("sampid","sex","age.group","batchdate","nreps"),
+                               variable.name = "PCn",
+                               value.name = "score") %>% 
+    filter(PCn %in% paste0("PC",1:atacseq$Vall$npcs)) %>%
+    mutate(PCn=apply(data.frame(PCn=.$PCn),1,function(s) sub("$",sprintf(" (%0.1f%%)",atacseq$Vall$pcvarp[as.numeric(sub("PC","",s))]),s))) %>%
+    group_by(PCn,age.group) %>%
+    mutate(p_sex=wilcox.test(x=subset(score,sex=="F"),y=subset(score,sex=="M"))$p.value) %>%
+    group_by(PCn,sex) %>%
+    mutate(p_group31=wilcox.test(x=subset(score,age.group=="HY"),y=subset(score,age.group=="HO"))$p.value,
+           p_group21=wilcox.test(x=subset(score,age.group=="HY"),y=subset(score,age.group=="HM"))$p.value,
+           p_group32=wilcox.test(x=subset(score,age.group=="HM"),y=subset(score,age.group=="HO"))$p.value) %>%
+    ungroup() %>%
+    mutate(p_sex_str=ifelse(p_sex<0.001,"***",ifelse(p_sex<0.01,"**",ifelse(p_sex<0.05,"*","n.s."))),
+           p_group31_str=ifelse(p_group31<0.001,"***",ifelse(p_group31<0.01,"**",ifelse(p_group31<0.05,"*","n.s."))),
+           p_group21_str=ifelse(p_group21<0.001,"***",ifelse(p_group21<0.01,"**",ifelse(p_group21<0.05,"*","n.s."))),
+           p_group32_str=ifelse(p_group32<0.001,"***",ifelse(p_group32<0.01,"**",ifelse(p_group32<0.05,"*","n.s.")))) %>%
+    arrange(PCn,p_group31_str,p_group21_str,p_group32_str,sex) %>%
+    mutate(p_sex_str=ifelse(duplicated(paste(PCn,age.group)),"",p_sex_str)) %>%
+    arrange(PCn,sex,age.group) %>%
+    mutate(p_group31_str=ifelse(duplicated(paste(PCn,sex)),"",p_group31_str),
+           p_group21_str=ifelse(duplicated(paste(PCn,sex)),"",p_group21_str),
+           p_group32_str=ifelse(duplicated(paste(PCn,sex)),"",p_group32_str))
+  atacseq$Vall$pcstats_anno <- data.frame(x1=c(0.8,1.8,2.8,0.82,0.82,1.82,1.22,1.22,2.22),
+                                          x2=c(1.2,2.2,3.2,1.78,2.78,2.78,2.18,3.18,3.18),
+                                          y=c(rep(min(atacseq$Vall$pcstats$score),3)*1.5,rep(max(atacseq$Vall$pcstats$score),3)*1.6,rep(max(atacseq$Vall$pcstats$score),3)*1.8),
+                                          tag=c("HY","HM","HO","F","F","F","M","M","M"))
+  atacseq$Vall$gene.uni <- sort(union(as.character(anno.rna.pbmc$GeneName),as.character((atac.allpeaks.anno.pbmc %>% filter(abs(DistancetoTSS)<=0))$GeneName)))
+  atacseq$Vall$pcstd_toppeaks <- lapply(data.frame(atacseq$Vall$rotation) %>% select(PC1),function(pc) {
+    pcstd = (pc-mean(pc))/sd(pc)
+    toppeak = data.frame(trend=ifelse(pcstd>=quantile(pcstd[pcstd>0],1-pcstd_cutoff),"PC1+",ifelse(pcstd<=-quantile(abs(pcstd[pcstd<0]),1-pcstd_cutoff),"PC1-","Neutral")),
+                         peakco=rownames(atacseq$Vall$rotation),
+                         stringsAsFactors = F)
+    return(toppeak)
+  })
+  with(atacseq,save(Vall,file = atac_pca.fname))
+}
+
+p1 <- with(atacseq,
+           ggplot(Vall$pcdata,aes(PC1,PC2,color=age.group,shape=sex)) +
+             stat_chull(aes(PC1,PC2,fill=age.group,color=age.group),
+                        alpha=0.05,size=0.25,linetype=2,inherit.aes = F,show.legend = F) +
+             geom_point(size=3,alpha=0.75) +
+             geom_rug(show.legend = F) +
+             geom_hline(yintercept = 0,size=0.25,color="dimgray") +
+             geom_vline(xintercept = 0,size=0.25,color="dimgray") +
+             scale_color_manual(values = colors_age,
+                                guide=guide_legend(title = "Age group",title.theme = element_text(size=9),label.theme = element_text(size=8))) +
+             scale_fill_manual(values = colors_age,guide=F) +
+             scale_shape_manual(values = shape_sex,
+                                guide=guide_legend(title = "Sex",title.theme = element_text(size=9),label.theme = element_text(size=8))) +
+             scale_alpha_manual(values = c(`TRUE`=1,`FALSE`=0.05),guide=F) +
+             labs(x=paste0("PC1 (",sprintf("%0.1f%% of the variance)",Vall$pcvarp[1])),
+                  y=paste0("PC2 (",sprintf("%0.1f%% of the variance)",Vall$pcvarp[2])),
+                  title="Chromatin accessibility") +
+             theme_bw(base_size = 13) +
+             theme(aspect.ratio = 1,
+                   legend.position = "bottom")
+)
+ggsave(plot = p1,filename = "./Fig1/fig1_atac_pca_agebysex.pdf")
+ggsave(plot = p1,filename = "./Fig1/fig1_atac_pca_agebysex.tiff",dpi = 900)
+
+# RNA
+rna_pca.fname = "data-repo/rna.pca.RData"
+
+if (rna_pca.fname %in% dir(recursive = T)) {
+  rna_pca_data <- load(rna_pca.fname,envir = rnaseq)
+} else {
+  rnaseq$Vall <- prcomp(t(adj.data.rna %>% column_to_rownames("EnsemblID") %>% select(rnaseq$samps)),scale. = T)
+  rnaseq$Vall$npcs = 5
+  rnaseq$Vall$pcvarp <- (100*(rnaseq$Vall$sdev)^2/sum((rnaseq$Vall$sdev)^2))[1:rnaseq$Vall$npcs]
+  rnaseq$Vall$pcdata <- data.frame(rnaseq$Vall$x)[,1:rnaseq$Vall$npcs] %>%
+    mutate(sampid=rownames(.),
+           PC2=-PC2,
+           PC4=-PC4,
+           PC5=-PC5) %>%
+    inner_join(data.frame(sampid,sex,age.group,batchdate,nreps,stringsAsFactors = F),by="sampid")
+  rnaseq$Vall$rotation[,c(2,4,5)] <- -rnaseq$Vall$rotation[,c(2,4,5)]
+  rnaseq$Vall$pcstats <- melt(rnaseq$Vall$pcdata,id.vars = c("sampid","sex","age.group","batchdate","nreps"),
+                              variable.name = "PCn",
+                              value.name = "score") %>% 
+    filter(PCn %in% paste0("PC",1:rnaseq$Vall$npcs)) %>%
+    mutate(PCn=apply(data.frame(PCn=.$PCn),1,function(s) sub("$",sprintf(" (%0.1f%%)",rnaseq$Vall$pcvarp[as.numeric(sub("PC","",s))]),s))) %>%
+    group_by(PCn,age.group) %>%
+    mutate(p_sex=wilcox.test(x=subset(score,sex=="F"),y=subset(score,sex=="M"))$p.value) %>%
+    group_by(PCn,sex) %>%
+    mutate(p_group31=wilcox.test(x=subset(score,age.group=="HY"),y=subset(score,age.group=="HO"))$p.value,
+           p_group21=wilcox.test(x=subset(score,age.group=="HY"),y=subset(score,age.group=="HM"))$p.value,
+           p_group32=wilcox.test(x=subset(score,age.group=="HM"),y=subset(score,age.group=="HO"))$p.value) %>%
+    ungroup() %>%
+    mutate(p_sex_str=ifelse(p_sex<0.01,"***",ifelse(p_sex<0.05,"**",ifelse(p_sex<0.1,"*","n.s."))),
+           p_group31_str=ifelse(p_group31<0.01,"***",ifelse(p_group31<0.05,"**",ifelse(p_group31<0.1,"*","n.s."))),
+           p_group21_str=ifelse(p_group21<0.01,"***",ifelse(p_group21<0.05,"**",ifelse(p_group21<0.1,"*","n.s."))),
+           p_group32_str=ifelse(p_group32<0.01,"***",ifelse(p_group32<0.05,"**",ifelse(p_group32<0.1,"*","n.s.")))) %>%
+    arrange(PCn,p_group31_str,p_group21_str,p_group32_str,sex) %>%
+    mutate(p_sex_str=ifelse(duplicated(paste(PCn,age.group)),"",p_sex_str)) %>%
+    arrange(PCn,sex,age.group) %>%
+    mutate(p_group31_str=ifelse(duplicated(paste(PCn,sex)),"",p_group31_str),
+           p_group21_str=ifelse(duplicated(paste(PCn,sex)),"",p_group21_str),
+           p_group32_str=ifelse(duplicated(paste(PCn,sex)),"",p_group32_str))
+  rnaseq$Vall$pcstats_anno <- data.frame(x1=c(0.8,1.8,2.8,0.82,0.82,1.82,1.22,1.22,2.22),
+                                         x2=c(1.2,2.2,3.2,1.78,2.78,2.78,2.18,3.18,3.18),
+                                         y=c(rep(min(rnaseq$Vall$pcstats$score),3)*1.5,rep(max(rnaseq$Vall$pcstats$score),3)*1.6,rep(max(rnaseq$Vall$pcstats$score),3)*1.8),
+                                         tag=c("HY","HM","HO","F","F","F","M","M","M"))
+  rnaseq$Vall$gene.uni <- sort(union(as.character(anno.rna.pbmc$GeneName),as.character((atac.allpeaks.anno.pbmc %>% filter(abs(DistancetoTSS)<=0))$GeneName)))
+  rnaseq$Vall$pcstd_toppeaks <- lapply(data.frame(rnaseq$Vall$rotation) %>% select(PC1),function(pc) {
+    pcstd = (pc-mean(pc))/sd(pc)
+    toppeak = data.frame(trend=ifelse(pcstd>=quantile(pcstd[pcstd>0],1-pcstd_cutoff),"PC1+",ifelse(pcstd<=-quantile(abs(pcstd[pcstd<0]),1-pcstd_cutoff),"PC1-","Neutral")),
+                         EnsemblID=rownames(rnaseq$Vall$rotation),
+                         stringsAsFactors = F)
+    return(toppeak)
+  })
+  with(rnaseq,save(Vall,file = rna_pca.fname))
+}
+
+p2 <- with(rnaseq,
+           ggplot(Vall$pcdata,aes(PC1,PC2,color=age.group,shape=sex)) +
+             stat_chull(aes(PC1,PC2,fill=age.group,color=age.group),
+                        alpha=0.05,size=0.25,linetype=2,inherit.aes = F,show.legend = F) +
+             geom_point(size=3,alpha=0.75) +
+             geom_rug(show.legend = F) +
+             geom_hline(yintercept = 0,size=0.25,color="dimgray") +
+             geom_vline(xintercept = 0,size=0.25,color="dimgray") +
+             scale_color_manual(values = colors_age,
+                                guide=guide_legend(title = "Age group",title.theme = element_text(size=9),label.theme = element_text(size=8))) +
+             scale_fill_manual(values = colors_age,guide=F) +
+             scale_shape_manual(values = shape_sex,
+                                guide=guide_legend(title = "Sex",title.theme = element_text(size=9),label.theme = element_text(size=8))) +
+             scale_alpha_manual(values = c(`TRUE`=1,`FALSE`=0.05),guide=F) +
+             labs(x=paste0("PC1 (",sprintf("%0.1f%% of the variance)",Vall$pcvarp[1])),
+                  y=paste0("PC2 (",sprintf("%0.1f%% of the variance)",Vall$pcvarp[2])),
+                  title="Gene expression") +
+             theme_bw(base_size = 13) +
+             theme(aspect.ratio = 1,
+                   legend.position = "bottom")
+)
+ggsave(plot = p2,filename = "./Fig1/fig1_rna_pca_agebysex.pdf")
+ggsave(plot = p2,filename = "./Fig1/fig1_rna_pca_agebysex.tiff",dpi = 900)
+
+# PC1 scores
+q1 <- with(atacseq,
+           Vall$pcstats %>% 
+             filter(grepl("PC1",PCn)) %>% {
+               ggplot(.,aes(age.group,score,fill=sex,color=sex)) +
+                 # geom_violin(size=0.25,alpha=0.5,draw_quantiles = 0.5,trim = F,scale = "area",position = position_dodge(width = 0.8)) +
+                 geom_boxplot(size=0.25,alpha=0.5,position = position_dodge(width = 0.8)) +
+                 geom_point(size=0.75,alpha=0.5,position=position_jitterdodge(dodge.width = 0.8,jitter.width = 0.25)) +
+                 geom_hline(yintercept = 0,size=0.25,color="dimgray") +
+                 geom_curve(data=Vall$pcstats_anno[1:3,],aes(x=x1,xend=x2,y=y,yend=y,color=tag),curvature=0.3,alpha=0.75,size=1,inherit.aes = F) +
+                 geom_curve(data=Vall$pcstats_anno[4:9,],aes(x=x1,xend=x2,y=y,yend=y,color=tag),curvature=-0.35,alpha=0.35,size=1,inherit.aes = F) +
+                 geom_text(data=subset(.,p_sex_str!=""),aes(x=rep(c(1,2,3),1),y=min(Vall$pcstats$score)*1.5,label=p_sex_str),color="black",vjust=-0.25,hjust=0.5,size=3,inherit.aes = F) +
+                 geom_text(data=subset(.,p_group31_str!=""),aes(x=rep(c(0.5*(0.82+2.78),0.5*(1.22+3.18)),1),y=max(Vall$pcstats$score)*c(1.625,1.825),label=p_group31_str),color="black",vjust=0.25,hjust=0.5,size=2.5,inherit.aes = F) +
+                 geom_text(data=subset(.,p_group32_str!=""),aes(x=rep(c(0.5*(1.82+2.78),0.5*(2.22+3.18)),1),y=max(Vall$pcstats$score)*c(1.6,1.8),label=p_group32_str),color="black",vjust=0.25,hjust=0.5,size=2.5,inherit.aes = F) +
+                 geom_text(data=subset(.,p_group21_str!=""),aes(x=rep(c(0.5*(0.82+1.78),0.5*(1.22+2.18)),1),y=max(Vall$pcstats$score)*c(1.6,1.8),label=p_group21_str),color="black",vjust=0.25,hjust=0.5,size=2.5,inherit.aes = F) +
+                 scale_color_manual(values = c(colors_sex,colors_age),guide=F) +
+                 scale_fill_manual(values = colors_sex,guide=guide_legend(title = "Sex",title.theme = element_text(size=9),label.theme = element_text(size=8),override.aes = list(color=NA))) +
+                 scale_y_continuous(expand = c(0.1,0)) +
+                 labs(x="Age group",
+                      y="PC1 scores",
+                      title=paste0("Chromatin accessibility\n",.$PCn[1]),
+                      caption="*: P<0.05, **: P<0.01, ***: P<0.001") +
+                 theme_bw(base_size = 13) +
+                 theme(aspect.ratio = 3.5,
+                       plot.caption = element_text(hjust=0,size=7,angle=0,face="italic"),
+                       plot.title = element_text(hjust=0,size=9),
+                       legend.position = "bottom")
+             }
+)
+q2 <- with(rnaseq,
+           Vall$pcstats %>% 
+             filter(grepl("PC1",PCn)) %>% {
+               ggplot(.,aes(age.group,score,fill=sex,color=sex)) +
+                 # geom_violin(size=0.25,alpha=0.5,draw_quantiles = 0.5,trim = F,scale = "area",position = position_dodge(width = 0.8)) +
+                 geom_boxplot(size=0.25,alpha=0.5,position = position_dodge(width = 0.8)) +
+                 geom_point(size=0.75,alpha=0.5,position=position_jitterdodge(dodge.width = 0.8,jitter.width = 0.25)) +
+                 geom_hline(yintercept = 0,size=0.25,color="dimgray") +
+                 geom_curve(data=Vall$pcstats_anno[1:3,],aes(x=x1,xend=x2,y=y,yend=y,color=tag),curvature=0.3,alpha=0.75,size=1,inherit.aes = F) +
+                 geom_curve(data=Vall$pcstats_anno[4:9,],aes(x=x1,xend=x2,y=y,yend=y,color=tag),curvature=-0.35,alpha=0.35,size=1,inherit.aes = F) +
+                 geom_text(data=subset(.,p_sex_str!=""),aes(x=rep(c(1,2,3),1),y=min(Vall$pcstats$score)*1.5,label=p_sex_str),color="black",vjust=-0.25,hjust=0.5,size=3,inherit.aes = F) +
+                 geom_text(data=subset(.,p_group31_str!=""),aes(x=rep(c(0.5*(0.82+2.78),0.5*(1.22+3.18)),1),y=max(Vall$pcstats$score)*c(1.65,1.85),label=p_group31_str),color="black",vjust=0.25,hjust=0.5,size=2.5,inherit.aes = F) +
+                 geom_text(data=subset(.,p_group32_str!=""),aes(x=rep(c(0.5*(1.82+2.78),0.5*(2.22+3.18)),1),y=max(Vall$pcstats$score)*c(1.6,1.8),label=p_group32_str),color="black",vjust=0.25,hjust=0.5,size=2.5,inherit.aes = F) +
+                 geom_text(data=subset(.,p_group21_str!=""),aes(x=rep(c(0.5*(0.82+1.78),0.5*(1.22+2.18)),1),y=max(Vall$pcstats$score)*c(1.6,1.8),label=p_group21_str),color="black",vjust=0.25,hjust=0.5,size=2.5,inherit.aes = F) +
+                 scale_color_manual(values = c(colors_sex,colors_age),guide=F) +
+                 scale_fill_manual(values = colors_sex,guide=guide_legend(title = "Sex",title.theme = element_text(size=9),label.theme = element_text(size=8),override.aes = list(color=NA))) +
+                 scale_y_continuous(expand = c(0.1,0)) +
+                 labs(x="Age group",
+                      y=NULL,
+                      title=paste0("Gene expression\n",.$PCn[1]),
+                      caption="*: P<0.1, **: P<0.05, ***: P<0.01") +
+                 theme_bw(base_size = 13) +
+                 theme(aspect.ratio = 3.5,
+                       plot.caption = element_text(hjust=0,size=7,angle=0,face="italic"),
+                       plot.title = element_text(hjust=0,size=9),
+                       legend.position = "bottom")
+             }
+)
+pc1grid <- plot_grid(q1,q2,nrow=1,rel_widths = c(0.5,0.5),ncol = 3)
+ggsave(plot = pc1grid,filename = "./Fig1/fig1_atacrna_pc1_agebysex.pdf")
+
+
+```
+
+# Figure 1C. PCA enrichments
+
+```{r fig1c_pca.enrichtests, fig.asp=1}
+
+# Data
+atac_pca.fname = "data-repo/atac.pca.RData"
+atac_pca_data <- load(atac_pca.fname,envir = atacseq)
+rna_pca.fname = "data-repo/rna.pca.RData"
+rna_pca_data <- load(rna_pca.fname,envir = rnaseq)
+
+## Cell-specific chromHMM states (ATAC only)
+ctsets = c("fine","gross","lineage","function","state","sublineage")
+atac.bypc_tested.chromhmm_enrichment_agebysex.all <- do.call(rbind,lapply(ctsets, function(ctset) {
+  print(ctset)
+  cs_test <- module_test_peaks(peak.anno=atac.allpeaks.anno.pbmc %>%
+                                 inner_join(atacseq$Vall$pcstd_toppeaks$PC1,by="peakco") %>%
+                                 filter(trend!="Neutral") %>%
+                                 mutate(logFC=ifelse(trend=="PC1+",1,-1),
+                                        FDR=0),
+                               background=atac.allpeaks.anno.pbmc %>% inner_join(adj.data.atac %>% select(peakco),by="peakco") %>% select(chr,start,end),
+                               test.fdr=fdr.thresh,
+                               test.logfc=Inf,
+                               logfc.name="logFC",
+                               fdr.name="FDR",
+                               direction.string=list(pos="PC1+",neg="PC1-"),
+                               comp.name="ctspec_peaks",
+                               peakset=atac.allpeaks.anno.pbmc %>% 
+                                 inner_join(adj.data.atac %>% 
+                                              select(peakco,Specificity=paste("RE_specificity",ctset,sep="_")),
+                                            by="peakco") %>% 
+                                 select(chr,start,end,Specificity) %>% 
+                                 filter(!is.na(Specificity)) %>% 
+                                 split(.,f=.$Specificity),
+                               min.peakcount=3,
+                               enrich.fdr=fdr.thresh.enrichtest,
+                               flank.size = 1e5,
+                               verbose=FALSE)
+  cs_test <- cs_test[!sapply(lapply(cs_test,`[[`,1),is.null)]
+  cs_out <- cs_test$all %>%
+    mutate(PC="PC1",
+           celltype_set=ctset)
+  return(cs_out)
+})) %>%
+  mutate(hypergeom.p=ifelse(is.infinite(hypergeom.p),max((data.frame(.) %>% filter(!is.infinite(hypergeom.p)))$hypergeom.p),hypergeom.p),
+         signed.hypergeom.p=ifelse(grepl("PC1-",direction),-hypergeom.p,hypergeom.p),
+         hypergeom.fdr=p.adjust(10^(-hypergeom.p),method = "fdr"))
+hmm_threshP <- min((atac.bypc_tested.chromhmm_enrichment_agebysex.all %>% filter(hypergeom.fdr<=fdr.thresh.enrichtest))$hypergeom.p)
+
+ntest = nrow(atac.allpeaks.anno.pbmc %>% inner_join(atacseq$Vall$pcstd_toppeaks$PC1,by="peakco") %>% filter(trend!="Neutral"))
+nbg <- nrow(adj.data.atac)
+p0 <- ggplot(atac.bypc_tested.chromhmm_enrichment_agebysex.all %>%
+               filter(celltype_set=="state") %>%
+               dcast(., celltype~direction,value.var="signed.hypergeom.p") %>%
+               filter_all(function(x) !is.na(x)) %>%
+               mutate(isSignif=apply(data.frame(.) %>% select(-celltype),1,function(x) any(abs(x)>=hmm_threshP))) %>%
+               filter(isSignif) %>%
+               select(-isSignif) %>%
+               melt(.,id.vars=c("celltype"),variable.name = "direction",value.name = "signed.hypergeom.p") %>%
+               arrange(signed.hypergeom.p) %>% 
+               mutate(celltype=factor(celltype,levels = unique(.$celltype)),
+                      signed.hypergeom.p=ifelse(abs(signed.hypergeom.p)>40,sign(signed.hypergeom.p)*40,signed.hypergeom.p)),
+             aes(direction,celltype,fill=signed.hypergeom.p)) +
+  geom_point(shape=21,stroke=0.1,size=60) +
+  geom_hline(yintercept = seq(0.5,1000.5,1),size=0.25,color="gray50") +
+  geom_vline(xintercept = c(0.5,1.5,2.5),size=0.25,color="gray50") +
+  scale_fill_gradient2(low = coolwarm(9)[1],mid = "white",high = coolwarm(9)[9],
+                       guide=guide_colorbar(title="Enrichment, -logP",
+                                            title.position = "left",
+                                            title.theme = element_text(angle=90,hjust=0.5))) +
+  scale_x_discrete(expand = c(0,0.5)) +
+  scale_y_discrete(expand = c(0,0.5)) +
+  coord_equal() +
+  labs(y="Tested cell specificity",
+       x=paste0("Top/bottom ",100*pcstd_cutoff,"th PC score percentiles"),
+       title=paste0("PC scores enrichment (",sprintf("%1.0f",100*fdr.thresh.enrichtest),"% FDR)"),
+       subtitle="Cell-specific chromHMM states",
+       caption=paste0("Based on N=",ntest," test peaks and N=",nbg," background peaks.")) +
+  theme_minimal(base_size = 20) +
+  theme(legend.position = "right",
+        strip.text = element_text(hjust=0),
+        axis.text.x = element_text(angle=45,hjust=1),
+        plot.title = element_text(hjust=0.5),
+        plot.subtitle = element_text(hjust=0.5),
+        panel.grid = element_blank(),
+        plot.caption = element_text(hjust=0,face = "italic",size = 8))
+ggsave(p0,filename = "./Fig1/fig1_atac_pca_enrichment_chromhmm_agebysex.pdf")
+
+## Gene-based sets
+# ATAC-seq
+gsets = c("vp2008","dice_major","scrnaseq_pbmc_simple_specific")
+atac.bypc_tested.geneset_enrichment_agebysex.all <- do.call(rbind,lapply(gsets, function(gs) {
+  print(gs)
+  gs_test <- module_test_peaks(peak.anno=atac.allpeaks.anno.pbmc %>%
+                                 inner_join(atacseq$Vall$pcstd_toppeaks$PC1,by="peakco") %>%
+                                 filter(trend!="Neutral") %>%
+                                 mutate(logFC=ifelse(trend=="PC1+",1,-1),
+                                        FDR=0),
+                               background=atac.allpeaks.anno.pbmc  %>% inner_join(adj.data.atac %>% select(peakco),by="peakco") %>% select(chr,start,end),
+                               test.fdr=fdr.thresh,
+                               test.logfc=Inf,
+                               logfc.name="logFC",
+                               fdr.name="FDR",
+                               direction.string=list(pos="PC1+",neg="PC1-"),
+                               comp.name=paste(gs,"peaks",sep = "_"),
+                               peakset=atac.allpeaks.anno.pbmc %>% 
+                                 inner_join(merge(get(paste0("geneset.names.",gs),envir = gsenv),get(paste0("geneset.genes.",gs),envir = gsenv),by="Module.ID") %>%
+                                              select(-Module.ID),
+                                            by="GeneName") %>% 
+                                 split(.,f=.$Module.Name),
+                               min.peakcount=3,
+                               enrich.fdr=fdr.thresh.enrichtest,
+                               flank.size = 1e5,
+                               verbose=FALSE)
+  gs_test <- gs_test[!sapply(lapply(gs_test,`[[`,1),is.null)]
+  gs_out <- gs_test$all %>%
+    mutate(PC="PC1",
+           geneset=gs)
+  return(gs_out)
+})) %>%
+  dplyr::rename(Module.Name="celltype") %>%
+  mutate(hypergeom.p=ifelse(is.infinite(hypergeom.p),max((data.frame(.) %>% filter(!is.infinite(hypergeom.p)))$hypergeom.p),hypergeom.p),
+         signed.hypergeom.p=ifelse(grepl("PC1-",direction),-hypergeom.p,hypergeom.p),
+         hypergeom.fdr=p.adjust(10^(-hypergeom.p),method = "fdr"))
+
+## RNAseq
+gsets = c("vp2008","dice_major","scrnaseq_pbmc_simple_specific")
+rna.bypc_tested.geneset_enrichment_agebysex.all <- do.call(rbind,lapply(gsets, function(gs) {
+  print(gs)
+  gs_test <- module_test_rna(rna.glm=anno.rna.pbmc %>%
+                               inner_join(rnaseq$Vall$pcstd_toppeaks$PC1,by="EnsemblID") %>%
+                               filter(trend!="Neutral") %>%
+                               mutate(logFC=ifelse(trend=="PC1+",1,-1),
+                                      FDR=0),
+                             background=unique((anno.rna.pbmc%>% inner_join(adj.data.rna %>% select(GeneName),by="GeneName"))$GeneName),
+                             test.fdr=fdr.thresh.rna,
+                             test.logfc=Inf,
+                             logfc.name="logFC",
+                             fdr.name="FDR",
+                             direction.string=list(pos="PC1+",neg="PC1-"),
+                             comp.name=paste(gs,"transcripts",sep = "_"),
+                             geneset.path = geneset.path,
+                             geneset.sel = gs,
+                             enrich.fdr=fdr.thresh.enrichtest,
+                             synonymize=TRUE,
+                             verbose=FALSE)
+  gs_test <- gs_test[!sapply(lapply(gs_test,`[[`,1),is.null)]
+  gs_out <- gs_test$all %>%
+    mutate(PC="PC1",
+           geneset=gs)
+  return(gs_out)
+})) %>%
+  dplyr::rename(direction="gene.set") %>%
+  mutate(hypergeom.p=ifelse(is.infinite(hypergeom.p),max((data.frame(.) %>% filter(!is.infinite(hypergeom.p)))$hypergeom.p),hypergeom.p),
+         signed.hypergeom.p=ifelse(grepl("PC1-",direction),-hypergeom.p,hypergeom.p),
+         hypergeom.fdr=p.adjust(10^(-hypergeom.p),method = "fdr"))
+
+# Combo plot
+gs.combo <- atac.bypc_tested.geneset_enrichment_agebysex.all %>%
+  select(geneset,Module.Name,direction,signed.hypergeom.p,hypergeom.p,hypergeom.fdr) %>%
+  mutate(data.source="ATAC-seq") %>%
+  rbind(rna.bypc_tested.geneset_enrichment_agebysex.all %>%
+          select(geneset,Module.Name,direction,signed.hypergeom.p,hypergeom.p,hypergeom.fdr) %>%
+          mutate(data.source="RNA-seq"))
+gs_threshP <- min((gs.combo %>% filter(hypergeom.fdr<=fdr.thresh.enrichtest))$hypergeom.p)
+
+ntest <- nrow(anno.rna.pbmc %>% inner_join(rnaseq$Vall$pcstd_toppeaks$PC1,by="EnsemblID") %>% filter(trend!="Neutral"))
+nbg <- length(unique(adj.data.rna$GeneName))
+
+p1 <- ggplot(gs.combo %>%
+               filter(geneset=="vp2008") %>%
+               dcast(., Module.Name~data.source+direction,value.var="signed.hypergeom.p") %>%
+               filter_all(function(x) !is.na(x)) %>%
+               mutate(isSignif=apply(data.frame(.) %>% select(-Module.Name),1,function(x) any(abs(x)>=gs_threshP))) %>%
+               filter(isSignif) %>%
+               select(-isSignif) %>%
+               melt(.,id.vars=c("Module.Name"),variable.name = "data.source",value.name = "signed.hypergeom.p") %>%
+               mutate(direction=sub(".*\\_","",data.source),
+                      data.source=sub("\\_.*","",data.source)) %>%
+               arrange(signed.hypergeom.p) %>% 
+               mutate(Module.Name=factor(Module.Name,levels = unique(.$Module.Name)),
+                      signed.hypergeom.p=ifelse(abs(signed.hypergeom.p)>40,sign(signed.hypergeom.p)*40,signed.hypergeom.p)),
+             aes(direction,Module.Name,fill=signed.hypergeom.p)) +
+  geom_point(shape=21,stroke=0.1,size=9) +
+  geom_hline(yintercept = seq(0.5,1000.5,1),size=0.25,color="gray50") +
+  geom_vline(xintercept = c(0.5,1.5,2.5),size=0.25,color="gray50") +
+  scale_fill_gradient2(low = coolwarm(9)[1],mid = "white",high = coolwarm(9)[9],
+                       guide=guide_colorbar(title="Enrichment, -logP",
+                                            title.position = "left",
+                                            title.theme = element_text(size=8,angle=90,hjust=0.5))) +
+  scale_x_discrete(expand = c(0,0.5)) +
+  scale_y_discrete(expand = c(0,0.5)) +
+  coord_equal() +
+  facet_wrap(~data.source) +
+  labs(y="Tested gene set",
+       x=paste0("Top/bottom ",100*pcstd_cutoff,"th PC score percentiles"),
+       title=paste0("PC scores enrichment (",sprintf("%1.0f",100*fdr.thresh.enrichtest),"% FDR)"),
+       subtitle="Immune Modules",
+       caption=paste0("Based on N=",ntest," test genes and\nN=",nbg," background genes")) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "right",
+        strip.text = element_text(hjust=0),
+        axis.text.x = element_text(size=7.5,angle=45,hjust=1),
+        plot.title = element_text(hjust=0.5),
+        panel.grid = element_blank(),
+        plot.caption = element_text(hjust=0,face = "italic",size = 5))
+ggsave(p1,filename = "./Fig1/fig1_arc_pca_enrichment_vp2008_agebysex.pdf")
+
+p2 <- ggplot(gs.combo %>%
+               filter(geneset=="dice_major") %>%
+               dcast(., Module.Name~data.source+direction,value.var="signed.hypergeom.p") %>%
+               filter_all(function(x) !is.na(x)) %>%
+               mutate(isSignif=apply(data.frame(.) %>% select(-Module.Name),1,function(x) any(abs(x)>=gs_threshP))) %>%
+               filter(isSignif) %>%
+               select(-isSignif) %>%
+               melt(.,id.vars=c("Module.Name"),variable.name = "data.source",value.name = "signed.hypergeom.p") %>%
+               mutate(direction=sub(".*\\_","",data.source),
+                      data.source=sub("\\_.*","",data.source)) %>%
+               arrange(data.source,signed.hypergeom.p) %>% 
+               mutate(Module.Name=factor(Module.Name,levels = unique(.$Module.Name)),
+                      signed.hypergeom.p=ifelse(abs(signed.hypergeom.p)>20,sign(signed.hypergeom.p)*20,signed.hypergeom.p)),
+             aes(direction,Module.Name,fill=signed.hypergeom.p)) +
+  geom_point(shape=21,stroke=0.1,size=30) +
+  geom_hline(yintercept = seq(0.5,1000.5,1),size=0.25,color="gray50") +
+  geom_vline(xintercept = c(0.5,1.5,2.5),size=0.25,color="gray50") +
+  scale_fill_gradient2(low = coolwarm(9)[1],mid = "white",high = coolwarm(9)[9],
+                       guide=guide_colorbar(title="Enrichment, -logP",
+                                            title.position = "left",
+                                            title.theme = element_text(angle=90,hjust=0.5))) +
+  scale_x_discrete(expand = c(0,0.5)) +
+  scale_y_discrete(expand = c(0,0.5)) +
+  coord_equal() +
+  facet_wrap(~data.source) +
+  labs(y="Tested gene set",
+       x=paste0("Top/bottom ",100*pcstd_cutoff,"th PC score percentiles"),
+       title=paste0("PC scores enrichment (",sprintf("%1.0f",100*fdr.thresh.enrichtest),"% FDR)"),
+       subtitle="DICE expression sets",
+       caption=paste0("Based on N=",ntest," test genes and N=",nbg," background genes")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "right",
+        strip.text = element_text(hjust=0),
+        axis.text.x = element_text(angle=45,hjust=1),
+        plot.title = element_text(hjust=0.5),
+        panel.grid = element_blank(),
+        plot.caption = element_text(hjust=0,face = "italic",size = 8))
+ggsave(p2,filename = "./Fig1/fig1_arc_pca_enrichment_dice_agebysex.pdf")
+
+p3 <- ggplot(gs.combo %>%
+               filter(geneset=="scrnaseq_pbmc_simple_specific") %>%
+               dcast(., Module.Name~data.source+direction,value.var="signed.hypergeom.p") %>%
+               filter_all(function(x) !is.na(x)) %>%
+               mutate(isSignif=apply(data.frame(.) %>% select(-Module.Name),1,function(x) any(abs(x)>=gs_threshP))) %>%
+               filter(isSignif) %>%
+               select(-isSignif) %>%
+               melt(.,id.vars=c("Module.Name"),variable.name = "data.source",value.name = "signed.hypergeom.p") %>%
+               mutate(direction=sub(".*\\_","",data.source),
+                      data.source=sub("\\_.*","",data.source)) %>%
+               arrange(data.source,signed.hypergeom.p) %>% 
+               mutate(Module.Name=factor(Module.Name,levels = unique(.$Module.Name)),
+                      signed.hypergeom.p=ifelse(abs(signed.hypergeom.p)>20,sign(signed.hypergeom.p)*20,signed.hypergeom.p)),
+             aes(direction,Module.Name,fill=signed.hypergeom.p)) +
+  geom_point(shape=21,stroke=0.1,size=15) +
+  geom_hline(yintercept = seq(0.5,1000.5,1),size=0.25,color="gray50") +
+  geom_vline(xintercept = c(0.5,1.5,2.5),size=0.25,color="gray50") +
+  scale_fill_gradient2(low = coolwarm(9)[1],mid = "white",high = coolwarm(9)[9],
+                       guide=guide_colorbar(title="Enrichment, -logP",
+                                            title.position = "left",
+                                            title.theme = element_text(angle=90,hjust=0.5))) +
+  scale_x_discrete(expand = c(0,0.5)) +
+  scale_y_discrete(expand = c(0,0.5)) +
+  coord_equal() +
+  facet_wrap(~data.source) +
+  labs(y="Tested gene set",
+       x=paste0("Top/bottom ",100*pcstd_cutoff,"th PC score percentiles"),
+       title=paste0("PC scores enrichment (",sprintf("%1.0f",100*fdr.thresh.enrichtest),"% FDR)"),
+       subtitle="scRNA-seq clusters",
+       caption=paste0("Based on N=",ntest," test genes and\nN=",nbg," background genes")) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right",
+        strip.text = element_text(hjust=0),
+        axis.text.x = element_text(angle=45,hjust=1),
+        plot.title = element_text(hjust=0.5),
+        panel.grid = element_blank(),
+        plot.caption = element_text(hjust=0,face = "italic",size = 8))
+ggsave(p3,filename = "./Fig1/fig1_arc_pca_enrichment_scrnaseq_agebysex.pdf")
+
+```
+
+
+```{r stemleaf_samp_spread}
+
+age.dist <- data.frame(decade=floor(age/10)*10,year=age%%10) %>%
+  cbind(sex) %>%
+  group_by(decade,year,sex) %>%
+  summarize(n=n()) %>%
+  ungroup() %>%
+  mutate(age=decade+year) %>%
+  inner_join(data.frame(age.group,age),by="age") %>%
+  arrange(decade,year,sex) %>%
+  mutate(ageLabel=ifelse(n>1,n,""))
+
+p <- ggplot(age.dist %>% filter(age<90),aes(factor(decade),year,shape=sex,size=sex,color=sex)) +
+  geom_point(position=position_dodge(width = 0.5)) +
+  geom_text(aes(label=ageLabel),size=3.5,position=position_dodge(width = 0.5),color="papayawhip") +
+  scale_y_continuous(breaks = seq(0,9,1),expand = expand_scale(mult = 0,add = 1)) +
+  scale_x_discrete(expand = expand_scale(mult = 0,add = 0.5)) +
+  scale_color_manual(values = colors_sex) +
+  scale_size_manual(values = c("F"=5.5,"M"=5)) +
+  labs(x="Decade of age",
+       y="Years of age",
+       title="Distribution of subject ages for this study",
+       caption = "Each point corresponds to a single sample except where indicated.\nPlot excludes n=1 90+ yo female used in analyses.") +
+  theme_bw(base_size = 10) +
+  theme(aspect.ratio = 0.5,
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_line(size = 16,color="#fff9ef"),
+        panel.grid.major.y = element_line(size = 0.5,color="peachpuff2"),
+        plot.caption = element_text(hjust=0,face = "italic",size = 7))
+ggsave(p,filename = "./Fig1/fig1_decadage_distribution_bysex.pdf")
+
+data.frame(age.group,age,stringsAsFactors = F) %>%
+  split(.,f=.$age.group) %>%
+  sapply(.,function(X) wilcox.test(subset(X,sex=="F")$age,(subset(X,sex=="M"))$age)$p.value) %>%
+  data.frame(Wilcoxon_Pvalue = .) %>%
+  rownames_to_column("age.group") %>%
+  inner_join(data.frame(age.group,age,sex,stringsAsFactors = F)) %>%
+  group_by(age.group,sex) %>%
+  summarize(mean_age=mean(age),
+            median_age=median(age),
+            sd_age=sd(age),
+            Wilcoxon_Pvalue=mean(Wilcoxon_Pvalue)) %>%
+  write.csv(.,file = "./Fig1/fig1_age_distribution_test_bysex.csv",quote = F,row.names = F,col.names = T)
+            
+
+```
+
+
+```{r frailty_scores}
+
+frailty <- data.frame(sampid,frailty.index,frail,sex,age.group,age) %>%
+  filter(!is.na(frailty.index)) %>%
+  mutate(flab=ifelse(frail,"FRAIL",""))
+
+p <- ggplot(frailty,aes(age.group,frailty.index,fill=sex,color=sex)) +
+  geom_hline(yintercept = 0.2,linetype=2,color="firebrick3",size=0.25) +
+  geom_boxplot(size=0.35,alpha=0.75,width=0.5,position=position_dodge(width = 0.65),outlier.size = 0) +
+  geom_point(size=1,alpha=0.75,position=position_jitterdodge(dodge.width = 0.65, jitter.width = 0.15)) +
+  stat_compare_means(comparisons = list(c("HY","HM"),c("HY","HO"),c("HM","HO")),size = 3,label = "p.signif",bracket.size = 0.1) +
+  stat_compare_means(aes(group=sex), size=3, label.y = -0.01, label = "p.signif") +
+  scale_fill_manual(values = colors_sex) +
+  scale_color_manual(values = sapply(colors_sex,darker)) +
+  labs(x="Age group",
+       y="Frailty index",
+       title="Frailty index distribution",
+       caption = "ns P>0.05, * P<0.05, ** P<0.01, *** P<0.001, **** P<0.0001") +
+  theme_bw(base_size = 10) +
+  theme(aspect.ratio = 2,
+        strip.background = element_blank(),
+        strip.text = element_text(size=6,hjust=0,face="italic"),
+        plot.caption = element_text(size=4.5, face="italic", hjust = 0))
+ggsave(p,filename = "./Fig1/fig1_frailty.index_distribution.pdf")
+
+```
+

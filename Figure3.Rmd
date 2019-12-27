@@ -1,0 +1,1289 @@
+---
+title: "Fig3"
+author: "Eladio J Marquez"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list = ls())
+
+library(pals)
+library(scales)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+library(cowplot)
+library(grid)
+library(gridExtra)
+library(gtable)
+library(tibble)
+library(pheatmap)
+library(ComplexHeatmap)
+library(Vennerable)
+library(reshape2)
+library(dplyr)
+
+# Loads ATAC data
+peak.set = "narrow"
+run.name="AgexSex_homo" # Age|AgexSex|AgexSex_homo
+batch.variable="batchdate" # batchdate|rebatch
+
+atac_data <- load(paste0("./data-repo/pbmc_aging.summer2017_",peak.set,"Peaks_filtered.RData"))
+atacseq <- new.env()
+atac_stats <- load(paste0("./data-repo/aging.summer2017_filtered_global.stats_",peak.set,"Peaks_filtered.RData"),envir = atacseq)
+da_output <- load(paste0("./data-repo/da_output_",run.name,"_",batch.variable,"_",peak.set,"Peaks","_BySex.RData"),envir = atacseq)
+adj.data.atac <- lapply(lapply(atacseq$da_bysex,`[[`,"da.list"),`[[`,"adj")[[1]] %>%
+  data.frame(.) %>%
+  rownames_to_column("peakco") %>%
+  inner_join(atac.allpeaks.anno.pbmc,.,by="peakco")
+
+# Expression data
+rna_data <- load("./data-repo/pbmc_aging.summer2017_RNA_filtered.RData")
+rnaseq <- new.env()
+rna_stats <- load(paste0("./data-repo/aging.summer2017_filtered_global.stats_RNA_filtered.RData"),envir = rnaseq)
+da_output.rna <- load(paste0("./data-repo/da_output_",run.name,"_",batch.variable,"_RNA_BySex.RData"),envir = rnaseq)
+adj.data.rna <- lapply(lapply(rnaseq$da_bysex,`[[`,"da.list"),`[[`,"adj")[[1]] %>%
+  data.frame(.) %>%
+  rownames_to_column("EnsemblID") %>%
+  inner_join(anno.rna.pbmc,.,by="EnsemblID")
+
+# Global parameters
+fdr.thresh = 0.05
+fdr.thresh.rna = 0.1
+pflank = 2000
+min.expressed = 3
+geneset.path = "./data-repo/geneset.info.RData"
+min.modgenes = 5
+gene.uni <- sort(unique((expressed.pbmc %>% mutate(EnsemblID=rownames(.)) %>% filter(Total.counts>=min.expressed) %>% inner_join(anno.rna.pbmc,by="EnsemblID"))$GeneName))
+fdr.thresh.enrichtest = 0.05
+focus.celltypes <- c("PBMC","CD14","CD56","CD19","CD4_naive","CD4_memory","CD8_naive","CD8_memory")
+ntop.gs = 15 # max number of gene sets to show for either down or up directions
+maxlogP = 20 # truncate larger loginvP values to this value, used in enrichment plots
+
+# Load annotation gene sets
+gsenv = new.env() 
+genesets <- load(geneset.path,envir = gsenv)
+
+# External+helper scripts
+source("./scripts/modules.enrichtest.R")
+source("./scripts/module_test_functions.R")
+source("./scripts/grafx_functions.R")
+source("./scripts/da_bypeakset.R")
+source("./scripts/ms_colors.R")
+source('./scripts/browser_shots.R')
+
+# Chromatin accessibility & expression differential anaysis results
+da.glm_agebysex.atac <- do.call(rbind,lapply(names(atacseq$da_bysex), function(n) {
+  atacseq$da_bysex[[n]]$da.list$glm %>%
+    rownames_to_column("peakco") %>%
+    mutate(Contrast=n)
+})) %>%
+  filter(!grepl("Age2",Contrast)) %>%
+  mutate(Contrast_color=ifelse(FDR<=fdr.thresh,ifelse(logFC<0,ifelse(grepl("Age1",.$Contrast),colors_age["Age1"],colors_age["Age2"]),ifelse(grepl("Age3",.$Contrast),colors_age["Age3"],colors_age["Age2"])),"black")) %>%
+  group_by(Contrast) %>%
+  mutate(nhits=sum(FDR<=fdr.thresh)) %>%
+  ungroup() %>%
+  mutate(Contrast_label=factor(paste0(Contrast,"\n(n=",nhits," hits)"))) %>%
+  mutate(Contrast_label=factor(Contrast_label,levels = levels(.$Contrast_label)[c(1,3,2,4,6,5)]))
+
+da.glm_agebysex.rna <- do.call(rbind,lapply(names(rnaseq$da_bysex), function(n) {
+  rnaseq$da_bysex[[n]]$da.list$glm %>%
+    rownames_to_column("EnsemblID") %>%
+    mutate(Contrast=n)
+})) %>%
+  filter(!grepl("Age2",Contrast)) %>%
+  mutate(Contrast_color=ifelse(FDR<=fdr.thresh.rna,ifelse(logFC<0,ifelse(grepl("Age1",.$Contrast),colors_age["Age1"],colors_age["Age2"]),ifelse(grepl("Age3",.$Contrast),colors_age["Age3"],colors_age["Age2"])),"black")) %>%
+  group_by(Contrast) %>%
+  mutate(nhits=sum(FDR<=fdr.thresh.rna)) %>%
+  ungroup() %>%
+  mutate(Contrast_label=factor(paste0(Contrast,"\n(n=",nhits," hits)"))) %>%
+  mutate(Contrast_label=factor(Contrast_label,levels = levels(.$Contrast_label)[c(1,3,2,4,6,5)]))
+
+```
+
+# Figure 3A. MA plot, age by sex, HO vs HY
+
+```{r fig3a_maplot, fig.asp=1}
+
+p <- ggplot(da.glm_agebysex.rna %>% 
+              mutate(Contrast_label=factor(sub("_",", ",sub("x"," vs ",sub("Age1","HY",sub("Age2","HM",sub("Age3","HO",Contrast_label))))))) %>%
+              arrange(-PValue),
+            aes(logCPM,logFC,color=Contrast_color)) +
+  geom_point(size=0.15,alpha=0.75) +
+  geom_hline(yintercept = 0,size=0.25) +
+  geom_vline(xintercept = 0,size=0.25) +
+  facet_wrap(~Contrast_label,dir = "h") +
+  scale_color_identity() +
+  labs(x="Average peak size, logCPM",
+       y="logFC",
+       title="Differential accessibility, HO-HY",
+       subtitle=paste0(100*fdr.thresh.rna,"% FDR")) +
+  theme_bw(base_size = 10) +
+  theme(aspect.ratio = 1,strip.background = element_blank())
+ggsave(plot = p,filename = "./Fig3/fig3_maplot_agebysex.pdf")
+ggsave(plot = p,filename = "./Fig3/fig3_maplot_agebysex.tiff",bg="transparent")
+
+shared_da.glm_agebysex.rna <- da.glm_agebysex.rna %>% 
+  filter(FDR<=fdr.thresh.rna) %>%
+  filter(EnsemblID %in% intersect(subset(data.frame(.),grepl("Females",Contrast) & FDR<=fdr.thresh.rna)$EnsemblID,
+                                  subset(data.frame(.),grepl("Males",Contrast) & FDR<=fdr.thresh.rna)$EnsemblID)) %>%
+  mutate(shared.status="Both DE") %>%
+  rbind(da.glm_agebysex.rna %>% 
+          filter(FDR<=fdr.thresh.rna) %>%
+          filter(!EnsemblID %in% intersect(subset(data.frame(.),grepl("Females",Contrast) & FDR<=fdr.thresh.rna)$EnsemblID,
+                                           subset(data.frame(.),grepl("Males",Contrast) & FDR<=fdr.thresh.rna)$EnsemblID)) %>%
+          mutate(shared.status=ifelse(grepl("Females",Contrast),"Females DE","Males DE"))) %>% 
+  mutate(direction=ifelse(logFC<0,"HY","HO")) %>%
+  group_by(shared.status,Contrast) %>%
+  mutate(nhits=n(),
+         Status_label=ifelse(shared.status=="Both DE","Both DE","Sex-specific DE")) %>%
+  ungroup() %>%
+  mutate(Contrast_label=paste0(sub("\\_Age3xAge1.*","",Contrast_label),"\n(",nhits,")"))
+
+q <- ggplot(shared_da.glm_agebysex.rna,aes(Contrast_label,logFC,fill=direction,color=direction)) +
+  geom_point(size=0.25,alpha=0.15,position=position_jitter(width = 0.05),color="dimgray") +
+  geom_hline(yintercept = 0,size=0.25,alpha = 0.5) +
+  geom_violin(position="identity",draw_quantiles = 0.5,scale = "area",trim = T,alpha=0.5,size=0.25) +
+  scale_fill_manual(values = colors_age,guide=F) +
+  scale_color_manual(values = colors_age,guide=F) +
+  facet_wrap(~Status_label,nrow = 1,drop = T,scales = "free_x") +
+  labs(x="Sex specificity of DE genes",
+       y="logFC, HO-HY",
+       title="Common vs. sex-specific differences\nin gene expression") +
+  theme_bw(base_size = 12) +
+  theme(aspect.ratio = 3,
+        strip.background = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+ggsave(plot = q,filename = "./Fig3/fig3_da.sexspec_agebysex.pdf")
+ggsave(plot = q,filename = "./Fig3/fig3_da.sexspec_agebysex.tiff",bg="transparent")
+
+```
+
+
+```{r fig3b_arc_enrichtest, fig.asp=1}
+
+focus.hmm.enrichtest = c("Tss","Enh")
+da_enrichment.fname = "./data-repo/arc.da_enrichment.RData"
+
+if (da_enrichment.fname %in% dir(recursive = T,full.names = T)) {
+  load(da_enrichment.fname)
+} else {
+  # Enrichment tests and plots
+  geneset_names <- setNames(list("scrnaseq_pbmc_simple_specific","dice_major","vp2008","wp"),
+                            c("scrnaseq_pbmc_simple_specific","dice_major","vp2008","wp"))
+  
+  # Test, ATAC, by gene set
+  atac.agebysex_names <- setNames(as.list(levels(da.glm_agebysex.atac$Contrast_label)),levels(da.glm_agebysex.atac$Contrast_label))
+  atac_tested.modules_agebysex <- lapply(atac.agebysex_names, function(x) {
+    print(x)
+    if (nrow(subset(da.glm_agebysex.atac,Contrast_label==x & FDR<=fdr.thresh))<min.modgenes) return(NULL)
+    lapply(geneset_names, function(gs) {
+      print(gs)
+      module_test(peak.anno=da.glm_agebysex.atac %>%
+                    filter(Contrast_label==x) %>%
+                    inner_join(atac.allpeaks.anno.pbmc,by="peakco") %>%
+                    filter_at(vars(grep("chromHMMsimple",colnames(.))), any_vars(. %in% focus.hmm.enrichtest)),
+                  background=unique((da.glm_agebysex.rna %>% inner_join(anno.rna.pbmc %>% select(EnsemblID,GeneName),by="EnsemblID"))$GeneName),
+                  test.fdr=fdr.thresh,
+                  test.logfc=Inf,
+                  logfc.name="logFC",
+                  fdr.name="FDR",
+                  direction.string=list(pos="Opening with aging",neg="Closing with aging"),
+                  comp.name=paste0("Sex@",x),
+                  geneset.path=geneset.path,
+                  enrich.fdr=fdr.thresh.enrichtest,
+                  flank.size = 1e5,
+                  geneset.sel=gs,
+                  synonymize.ext=TRUE,
+                  verbose=FALSE)
+    })
+  })
+  atac_tested.modules_agebysex <- atac_tested.modules_agebysex[!sapply(lapply(atac_tested.modules_agebysex,`[[`,1),is.null)]
+  
+  atac_tested.modules_agebysex.all <- do.call(rbind,lapply(names(atac_tested.modules_agebysex),function(n) {
+    X <- atac_tested.modules_agebysex[[n]]
+    if (is.null(X)) return(NULL)
+    do.call(rbind,lapply(names(X), function(gs) {
+      Xall <- X[[gs]]$all %>%
+        mutate(Contrast_label=n,
+               schema=gs,
+               Module.Name=sub("\\, ",",",sub(" \\- ","-",sub("\\ - TarBase.*","",sub("\\, including.*","",sub(" \\(.*","",sub(" \\- Homo.*","",Module.Name)))))),
+               Module.Label=sub(" \\(WP.*\\)","",sub(" \\- Homo sapiens \\(human\\)","",Module.Label)))
+      return(Xall)
+    }))
+  })) %>%
+    mutate(signed.hypergeom.p=ifelse(gene.set=="Closing with aging",-hypergeom.p,hypergeom.p),
+           Contrast_label=factor(Contrast_label,levels = levels(da.glm_agebysex.atac$Contrast_label))) %>%
+    split(.,f = .$schema)
+  
+  atac.threshP <- min(unlist(lapply(lapply(atac_tested.modules_agebysex.all, function(X) X %>% filter(hypergeom.fdr<=fdr.thresh.enrichtest)),`[[`,"hypergeom.p")))
+  
+  atac_tested.modules_agebysex.top <- do.call(rbind,lapply(names(atac_tested.modules_agebysex),function(n) {
+    X <- atac_tested.modules_agebysex[[n]]
+    if (is.null(X)) return(NULL)
+    do.call(rbind,lapply(names(X), function(gs) {
+      Xtop <- X[[gs]]$top %>%
+        mutate(Contrast_label=n,
+               schema=gs)
+      return(Xtop)
+    }))
+  })) %>%
+    dcast(.,gene.set+Contrast_label~paste(schema,Module.Name,sep = "@@@"),value.var = "hypergeom.p",fill=0) %>%
+    melt(.,id.vars = c("gene.set","Contrast_label"),variable.name = "Module.Name",value.name = "hypergeom.p") %>%
+    mutate(signed.hypergeom.p=ifelse(gene.set=="Closing with aging",-hypergeom.p,hypergeom.p),
+           Contrast_label=factor(Contrast_label,levels = levels(da.glm_agebysex.atac$Contrast_label)),
+           schema=sub("@@@.*","",Module.Name),
+           Module.Name=sub(".*@@@","",Module.Name),
+           Module.Name=sub("\\, ",",",sub(" \\- ","-",sub("\\ - TarBase.*","",sub("\\, including.*","",sub(" \\(.*","",sub(" \\- Homo.*","",Module.Name))))))) %>%
+    split(.,f = .$schema)
+  
+  # Test, RNA
+  rna.agebysex_names <- setNames(as.list(levels(da.glm_agebysex.rna$Contrast_label)),levels(da.glm_agebysex.rna$Contrast_label))
+  rna_tested.modules_agebysex <- lapply(rna.agebysex_names, function(x) {
+    print(x)
+    if (nrow(subset(da.glm_agebysex.rna,Contrast_label==x & FDR<=fdr.thresh.rna))<min.modgenes) return(NULL)
+    lapply(geneset_names, function(gs) {
+      print(gs)
+      module_test_rna(rna.glm=da.glm_agebysex.rna %>%
+                        filter(Contrast_label==x) %>%
+                        inner_join(anno.rna.pbmc,by="EnsemblID"),
+                      background=unique((da.glm_agebysex.rna %>% inner_join(anno.rna.pbmc %>% select(EnsemblID,GeneName),by="EnsemblID"))$GeneName),
+                      test.fdr=fdr.thresh.rna,
+                      test.logfc=Inf,
+                      logfc.name="logFC",
+                      fdr.name="FDR",
+                      direction.string=list(pos="Expression up with aging",neg="Expression down with aging"),
+                      comp.name=paste0("Sex@",x),
+                      geneset.path=geneset.path,
+                      enrich.fdr=fdr.thresh.enrichtest,
+                      geneset.sel=gs,
+                      synonymize.ext=TRUE,
+                      verbose=FALSE)
+    })
+  })
+  rna_tested.modules_agebysex <- rna_tested.modules_agebysex[!sapply(lapply(rna_tested.modules_agebysex,`[[`,1),is.null)]
+  
+  rna_tested.modules_agebysex.all <- do.call(rbind,lapply(names(rna_tested.modules_agebysex),function(n) {
+    X <- rna_tested.modules_agebysex[[n]]
+    if (is.null(X)) return(NULL)
+    do.call(rbind,lapply(names(X), function(gs) {
+      Xall <- X[[gs]]$all %>%
+        mutate(Contrast_label=n,
+               schema=gs,
+               Module.Name=sub("\\, ",",",sub(" \\- ","-",sub("\\ - TarBase.*","",sub("\\, including.*","",sub(" \\(.*","",sub(" \\- Homo.*","",Module.Name)))))),
+               Module.Label=sub(" \\(WP.*\\)","",sub(" \\- Homo sapiens \\(human\\)","",Module.Label)))
+      return(Xall)
+    }))
+  })) %>%
+    mutate(signed.hypergeom.p=ifelse(gene.set=="Expression down with aging",-hypergeom.p,hypergeom.p),
+           Contrast_label=factor(Contrast_label,levels = levels(da.glm_agebysex.rna$Contrast_label))) %>%
+    split(.,f = .$schema)
+  
+  rna.threshP <- min(unlist(lapply(lapply(rna_tested.modules_agebysex.all, function(X) X %>% filter(hypergeom.fdr<=fdr.thresh.enrichtest)),`[[`,"hypergeom.p")))
+  
+  rna_tested.modules_agebysex.top <- do.call(rbind,lapply(names(rna_tested.modules_agebysex),function(n) {
+    X <- rna_tested.modules_agebysex[[n]]
+    if (is.null(X)) return(NULL)
+    do.call(rbind,lapply(names(X), function(gs) {
+      Xtop <- X[[gs]]$top %>%
+        mutate(Contrast_label=n,
+               schema=gs)
+      return(Xtop)
+    }))
+  })) %>%
+    dcast(.,gene.set+Contrast_label~paste(schema,Module.Name,sep = "@@@"),value.var = "hypergeom.p",fill=0) %>%
+    melt(.,id.vars = c("gene.set","Contrast_label"),variable.name = "Module.Name",value.name = "hypergeom.p") %>%
+    mutate(signed.hypergeom.p=ifelse(gene.set=="Expression down with aging",-hypergeom.p,hypergeom.p),
+           Contrast_label=factor(Contrast_label,levels = levels(da.glm_agebysex.rna$Contrast_label)),
+           schema=sub("@@@.*","",Module.Name),
+           Module.Name=sub(".*@@@","",Module.Name),
+           Module.Name=sub("\\, ",",",sub(" \\- ","-",sub("\\ - TarBase.*","",sub("\\, including.*","",sub(" \\(.*","",sub(" \\- Homo.*","",Module.Name))))))) %>%
+    split(.,f = .$schema)
+  
+  # Test, ATAC+RNA combo
+  combo_tested.modules_agebysex.top <- lapply(names(geneset_names), function(gs) {
+    print(gs)
+    combo_top <- atac_tested.modules_agebysex.all[[gs]] %>% 
+      # filter(Module.Name %in% unique(atac_tested.modules_agebysex.top[[gs]]$Module.Name)) %>%
+      mutate(data.source="ATAC",
+             signed.hypergeom.p=ifelse(gene.set=="Closing with aging",-hypergeom.p,hypergeom.p)) %>% 
+      mutate(Contrast_label=factor(sub("\\_","\n",paste(.$data.source,.$Contrast_label,sep="\n")),
+                                   levels = sub("\\_","\n",levels(interaction(.$data.source,.$Contrast_label,sep = "\n"))))) %>%
+      rbind(rna_tested.modules_agebysex.all[[gs]] %>% 
+              # filter(Module.Name %in% unique(rna_tested.modules_agebysex.top[[gs]]$Module.Name)) %>%
+              mutate(data.source="RNA",
+                     signed.hypergeom.p=ifelse(gene.set=="Expression down with aging",-hypergeom.p,hypergeom.p)) %>%
+              mutate(Contrast_label=factor(sub("\\_","\n",paste(.$data.source,.$Contrast_label,sep="\n")),
+                                           levels = sub("\\_","\n",levels(interaction(.$data.source,.$Contrast_label,sep = "\n"))))))
+    if (gs=="scrnaseq_pbmc_simple_specific") {
+      combo_top <- combo_top %>%
+        mutate(Module.Name=factor(Module.Name,levels=rev(c("Monocytes","NK_cells","DCs","Megakaryocytes","Erythrocytes","HSCs","pDCs","Bcells","Plasma_cells","acCD8_Tcells","Tcells","Naive_Tcells"))))
+    }
+    return(combo_top)
+  })
+  combo.threshP <- min(unlist(lapply(lapply(combo_tested.modules_agebysex.top, function(X) X %>% filter(hypergeom.fdr<=fdr.thresh.enrichtest)),`[[`,"hypergeom.p")))
+  
+  save(list = c(ls(pattern = "atac_tested.*modules*"),ls(pattern = "rna_tested.*modules*"),ls(pattern = "combo_tested.*modules*"),ls(pattern = "*threshP")),file = da_enrichment.fname)
+}
+
+## Enrichment plots
+# Enrichment by geneset
+combo.tested.modules.results <- lapply(combo_tested.modules_agebysex.top, function(X) X %>% 
+                                 mutate(schema.Label=plyr::mapvalues(factor(schema, levels = c("scrnaseq_pbmc_simple_specific","dice_major","vp2008","wp")),
+                                                                     from = c("scrnaseq_pbmc_simple_specific","dice_major","vp2008","wp"),
+                                                                     to = paste("Source:",c("scRNAseq clusters","DICE cell-specific expression","Immune modules","Wikipathways")))) %>%
+                                 mutate(schema.Label=as.character(schema.Label)))
+ # max number of gene sets to show
+
+enplot <- lapply(combo.tested.modules.results, function(X) {
+  sch=X$schema[1]
+  print(sch)
+  # HOvHY
+  p <- X %>%
+    filter(grepl("Age3xAge1",Contrast_label)) %>%
+    mutate(Contrast_color=ifelse(signed.hypergeom.p<0,ifelse(grepl("Age1",.$Contrast_label),colors_age["HY"],colors_age["HM"]),ifelse(grepl("Age3",.$Contrast_label),colors_age["HO"],colors_age["HM"])),
+           Contrast_alpha=ifelse(hypergeom.p>combo.threshP,1,0.5),
+           Contrast_label=factor(sub("\nAge3xAge1","",Contrast_label)),
+           Module.Label=sub(" genes","",as.character(Module.Label))) %>%
+    group_by(Module.Label) %>%
+    mutate(m=mean(signed.hypergeom.p)) %>%
+    ungroup() %>%
+    arrange(m) %>%
+    mutate(Module.Label=factor(Module.Label,levels = unique(as.character(.$Module.Label)))) %>% 
+    left_join(data.frame(.) %>%
+                group_by(Module.Label) %>%
+                summarize(m=mean(m)) %>%
+                mutate(indx=row_number()) %>%
+                select(Module.Label,indx),
+              by="Module.Label") %>% 
+    ungroup() %>% 
+    filter(indx<=ntop.gs | indx>=max(indx)-ntop.gs) %>% 
+    mutate(signed.hypergeom.p = ifelse(hypergeom.p>maxlogP,sign(signed.hypergeom.p)*maxlogP,signed.hypergeom.p)) %>% {
+      ggplot(.,aes(Module.Name,signed.hypergeom.p,fill=Contrast_color,alpha=Contrast_alpha)) +
+        geom_bar(width = 0.75,stat="identity",position="identity") +
+        geom_text(data=subset(.,signed.hypergeom.p>0),aes(label=gene.count,color=Contrast_color),size=2,hjust=-0.3) +
+        geom_text(data=subset(.,signed.hypergeom.p<0),aes(label=gene.count,color=Contrast_color),size=2,hjust=1.3) +
+        geom_hline(yintercept = 0,size=0.25) +
+        geom_hline(yintercept = c(-combo.threshP,combo.threshP),size=0.25,color="firebrick4",linetype=2,alpha=0.25) +
+        scale_alpha_identity() +
+        scale_y_continuous(expand = c(0.28,0),breaks = seq(-(maxlogP+10),maxlogP+10,maxlogP/2),labels = abs(seq(-(maxlogP+10),maxlogP+10,maxlogP/2))) +
+        scale_fill_identity() +
+        scale_color_identity() +
+        facet_wrap(~Contrast_label,nrow = 2,drop = F) +
+        coord_flip() +
+        labs(y="Enrichment, -log10 P",
+             x=NULL,
+             title="Gene set enrichment",
+             subtitle=.$schema.Label[1],
+             caption=paste("Significance level:",100*fdr.thresh.enrichtest,"% FDR\nShown up to",ntop.gs*2,"top enriched gene sets\n-log P values truncated to max =",maxlogP)) +
+        theme_minimal(base_size = 8) +
+        theme(legend.position = "right",
+              aspect.ratio = 3,
+              panel.spacing = unit(1,"lines"),
+              axis.text.x = element_text(size = 6,angle = 0),
+              axis.text.y = element_text(size=7),
+              plot.caption = element_text(size=5,hjust=0,face="italic"))
+    }
+  ggsave(plot = p,filename = paste0("./Fig3/fig3_enrichment_top.",sch,"_agebysex_combo.pdf"))
+})
+
+enplot_focused <- lapply(combo.tested.modules.results[-4], function(X) {
+  sch=X$schema[1]
+  print(sch)
+  # HOvHY
+  p <- X %>%
+    filter(Module.Name %in% c(focus.celltypes,"Monocytes","NK_cells","Bcells","acCD8_Tcells","Tcells","Naive_Tcells","Cytotoxic cells","B cells","Inflammation I","Inflammation II","T cells","Myeloid lineage 1","Myeloid lineage 2","B_naive")) %>%
+    filter(grepl("Age3xAge1",Contrast_label)) %>%
+    mutate(Contrast_color=ifelse(signed.hypergeom.p<0,ifelse(grepl("Age1",.$Contrast_label),colors_age["HY"],colors_age["HM"]),ifelse(grepl("Age3",.$Contrast_label),colors_age["HO"],colors_age["HM"])),
+           Contrast_alpha=ifelse(hypergeom.p>combo.threshP,1,0.5),
+           Contrast_label=factor(sub("\nAge3xAge1","",Contrast_label)),
+           Module.Label=sub(" genes","",as.character(Module.Label))) %>%
+    group_by(Module.Label) %>%
+    mutate(m=mean(signed.hypergeom.p)) %>%
+    ungroup() %>%
+    arrange(m) %>%
+    mutate(Module.Label=factor(Module.Label,levels = unique(as.character(.$Module.Label)))) %>% 
+    left_join(data.frame(.) %>%
+                group_by(Module.Label) %>%
+                summarize(m=mean(m)) %>%
+                mutate(indx=row_number()) %>%
+                select(Module.Label,indx),
+              by="Module.Label") %>% 
+    ungroup() %>% 
+    filter(indx<=ntop.gs | indx>=max(indx)-ntop.gs) %>% 
+    mutate(signed.hypergeom.p = ifelse(hypergeom.p>maxlogP,sign(signed.hypergeom.p)*maxlogP,signed.hypergeom.p)) %>% {
+      ggplot(.,aes(Module.Name,signed.hypergeom.p,fill=Contrast_color,alpha=Contrast_alpha)) +
+        geom_bar(width = 0.75,stat="identity",position="identity") +
+        geom_text(data=subset(.,signed.hypergeom.p>0),aes(label=gene.count,color=Contrast_color),size=3,hjust=-0.3) +
+        geom_text(data=subset(.,signed.hypergeom.p<0),aes(label=gene.count,color=Contrast_color),size=3,hjust=1.3) +
+        geom_hline(yintercept = 0,size=0.25) +
+        geom_hline(yintercept = c(-combo.threshP,combo.threshP),size=0.25,color="firebrick4",linetype=2,alpha=0.25) +
+        scale_alpha_identity() +
+        scale_y_continuous(expand = c(0.28,0),breaks = seq(-(maxlogP+10),maxlogP+10,maxlogP/2),labels = abs(seq(-(maxlogP+10),maxlogP+10,maxlogP/2))) +
+        scale_fill_identity() +
+        scale_color_identity() +
+        facet_wrap(~Contrast_label,nrow = 2,drop = F) +
+        coord_flip() +
+        labs(y="Enrichment, -log10 P",
+             x=NULL,
+             title="Gene set enrichment",
+             subtitle=.$schema.Label[1],
+             caption=paste("Significance level:",100*fdr.thresh.enrichtest,"% FDR\nShown up to",ntop.gs*2,"top enriched gene sets\n-log P values truncated to max =",maxlogP)) +
+        theme_minimal(base_size = 10) +
+        theme(legend.position = "right",
+              aspect.ratio = 1,
+              panel.spacing = unit(1,"lines"),
+              axis.text.x = element_text(size = 6,angle = 0),
+              axis.text.y = element_text(size=9),
+              plot.caption = element_text(size=5,hjust=0,face="italic"))
+    }
+  ggsave(plot = p,filename = paste0("./Fig3/fig3_enrichment_top.",sch,"_agebysex_combo_focused.pdf"))
+})
+
+```
+
+
+```{r fig3c_geneset_heatmaps_selected}
+
+# Module Heatmaps, selected gene sets, sex pooled
+# VP2008 sets: cytotox, inflammation i/ii, t cells
+vp2008_sets <- c("Cytotoxic cells","T Cells","Inflammation I","Inflammation II") %>%
+  setNames(lettercase::str_snake_case(.))
+vp2008_gs <- do.call(rbind,lapply(lapply(lapply(rna_tested.modules_agebysex,`[[`,"vp2008"),`[[`,"geneset"),`[[`,"genes")) %>%
+  distinct() %>%
+  merge(.,rna_tested.modules_agebysex[[1]]$vp2008$geneset$names,by="Module.ID") %>%
+  select(-Module.ID) %>%
+  filter(Module.Name %in% vp2008_sets) %>%
+  split(.,f=.$Module.Name)
+# scRNAseq sets: b cells, monocytes
+scrnaseq_sets <- c("Bcells","Monocytes") %>%
+  setNames(lettercase::str_snake_case(.))
+scrnaseq_gs <- do.call(rbind,lapply(lapply(lapply(rna_tested.modules_agebysex,`[[`,"scrnaseq_pbmc_simple_specific"),`[[`,"geneset"),`[[`,"genes")) %>%
+  distinct() %>%
+  merge(.,rna_tested.modules_agebysex[[1]]$scrnaseq_pbmc_simple_specific$geneset$names,by="Module.ID") %>%
+  select(-Module.ID) %>%
+  filter(Module.Name %in% scrnaseq_sets) %>%
+  split(.,f=.$Module.Name)
+# Combined sets
+gsets_sets <- c(vp2008_sets,scrnaseq_sets)
+gsets_gs <- c(vp2008_gs,scrnaseq_gs)
+
+output <- lapply(as.list(gsets_sets), function(gs) {
+  print(gs)
+  pdf(paste0("./Fig3/hm/fig3_rna.do.heatmaps.summary_",names(gsets_sets[gsets_sets==gs]),"_agebysex.pdf"),width = 6,height = 6)
+  transcription <- da.glm_agebysex.rna %>% filter(FDR<=fdr.thresh.rna) %>% inner_join(anno.rna.pbmc,by="EnsemblID")
+  commonGenes = intersect(gsets_gs[[gs]]$GeneName,transcription$GeneName)
+  topGSdata <- transcription %>% 
+    filter(GeneName %in% commonGenes) %>%
+    arrange(GeneName,PValue) %>%
+    filter(!duplicated(GeneName)) %>%
+    merge(adj.data.rna %>% select(EnsemblID,rnaseq$samps),by="EnsemblID")
+  if (length(topGSdata)<2) return(NULL)
+  
+  sumheatmap_anno <- lapply(list(Females="F",Males="M"), function(sx) {
+    dt <- topGSdata %>% 
+      select(GeneName,rnaseq$samps[rnaseq$sex==sx]) %>% 
+      column_to_rownames("GeneName") %>% 
+      t() %>%
+      data.frame() %>%
+      rownames_to_column("sampid") %>%
+      mutate_at(vars(-sampid),funs((.-mean(.))/sd(.))) %>% 
+      inner_join(data.frame(age.group=rnaseq$age.group,sex=rnaseq$sex) %>% rownames_to_column("sampid"),by="sampid") %>%
+      group_by(age.group,sex) %>%
+      summarize_at(vars(-sampid),list(~median)) %>%
+      ungroup() %>%
+      mutate(sex=ifelse(sex=="F","Females","Males")) %>%
+      select(-sex) %>%
+      data.frame(.,row.names="age.group") %>%
+      t()
+    anno <- HeatmapAnnotation(boxplot = anno_boxplot(dt,
+                                                     axis_gp = gpar(fontsize=5),
+                                                     axis = T,
+                                                     border = F,
+                                                     gp = gpar(fill=colors_sex[[sx]],alpha=0.5,col=colorRampPalette(c(colors_sex[[sx]],"black"))(10)[6],lwd=1.5),
+                                                     size=unit(0.5,"mm")),
+                              # with(rnaseq,data.frame(age.group,age,sex,stringsAsFactors = F) %>% 
+                              #        mutate(sex=ifelse(sex==sx,"Females","Males")) %>% 
+                              #        filter(substr(sex,1,1)==sx,age.group!="HM") %>% 
+                              #        group_by(age.group) %>% 
+                              #        summarize(median_age=median(age)) %>% 
+                              #        ungroup()) %>%
+                              #   data.frame(.,row.names = .$age.group) %>%
+                              #   select(-median_age),
+                              # col = list(age.group=colors_age),
+                              show_legend = F,
+                              height=unit(15,"mm"),
+                              gap = unit(1,"mm"),
+                              which = "column")
+    return(list(hm.anno=anno,hm.data=dt))
+  })
+  
+  clstr <- hclust(dist(do.call(cbind,lapply(sumheatmap_anno,`[[`,"hm.data"))),method="ward.D2")
+  
+  sumheatmap <- lapply(list(Females="F",Males="M"), function(sx) {
+    Sx = ifelse(sx=="F","Females","Males")
+    anno <- sumheatmap_anno[[Sx]]$hm.anno
+    dt=sumheatmap_anno[[Sx]]$hm.data
+    hm <- Heatmap(dt,
+                  col = colorRampPalette(colors_redblu10)(100),
+                  row_names_gp = gpar(fontsize=8,fontface="italic"),
+                  column_names_gp = gpar(fontsize=12),
+                  column_names_side = "bottom",
+                  name = ifelse(sx=="M",gs,""),
+                  na_col = "gainsboro",
+                  column_title = ifelse(sx=="F","Females","Males"),
+                  cluster_rows = clstr,
+                  rect_gp = gpar(col = "bisque", lwd = 1),
+                  cluster_columns = F,
+                  show_row_dend = sx=="F",
+                  top_annotation = anno,
+                  show_row_names = sx=="M",
+                  top_annotation_height = unit(3,"lines"),
+                  show_heatmap_legend = sx=="M",
+                  width=unit(5,"lines"))
+    return(list(hm=hm,hm.anno=anno,hm.data=dt))
+  })
+  
+  hm_list <- sumheatmap$Females$hm + sumheatmap$Males$hm
+  draw(hm_list,gap = unit(5,"mm"))
+  dev.off()
+  return(list(sumheatmap,hm_list))
+})
+
+```
+
+
+```{r fig3c_dynamic_range_plots_selected}
+
+expression.summary <- adj.data.rna %>% 
+    melt(.,measure.vars=rnaseq$samps,variable.name="sampid",value.name="adj.score") %>%
+    mutate(sampid=as.character(sampid)) %>%
+    inner_join(with(rnaseq,data.frame(sampid,sex,age,age.group,stringsAsFactors = F)),by="sampid") %>%
+    mutate(grand.mean.score=mean(adj.score)) %>%
+    group_by(EnsemblID) %>%
+    mutate(norm.score=znorm(adj.score)) %>%
+    group_by(EnsemblID,GeneName,age.group,sex) %>%
+    summarize(mean.score=mean(norm.score),
+              grand.mean.score=mean(grand.mean.score)) %>%
+    ungroup() %>%
+    mutate(sex=plyr::mapvalues(sex,from = c("F","M"),to = c("Females","Males"))) %>%
+    inner_join(da.glm_agebysex.rna %>%
+                 mutate(sex=relevel(factor(sub("\\_.*","",Contrast)),ref="Females"),
+                        AgeContrast=sub("Age3","HO",sub("Age2","HM",sub("Age1","HY",sub(".*\\_","",Contrast))))),
+               by=c("EnsemblID","sex")) %>%
+    mutate(isMatch=apply(.,1,function(X) grepl(X["age.group"],X["AgeContrast"]))) %>%
+    filter(isMatch) %>%
+    select(-isMatch)
+
+output <- lapply(as.list(gsets_sets), function(gs) {
+  print(gs)
+  dyrgeplots <- lapply(list(Females="F",Males="M"), function(sx) {
+    pdf(paste0("./Fig3/dr/fig3_rna.do.dynamic.ranges_",names(gsets_sets[gsets_sets==gs]),"_agebysex.pdf"))
+    commonGenes = intersect(gsets_gs[[gs]]$GeneName,expression.summary$GeneName)
+    topGSdata <- expression.summary %>%
+      filter(GeneName %in% commonGenes) %>%
+      group_by(GeneName) %>%
+      mutate(minP=min(PValue),
+             minFDR=min(FDR)) %>%
+      ungroup() %>%
+      mutate(mean.rescore=mean.score+grand.mean.score) %>%
+      arrange(age.group,sex,GeneName,-logCPM) %>%
+      filter(!duplicated(paste(age.group,sex,GeneName))) %>%
+      mutate(geneset=gs)
+    if (length(topGSdata)<2) return(NULL)
+    
+    omitage <- "HM"
+    dp.age.group <- factor(with(rnaseq,age.group[age.group!=omitage]))
+    dp.sex <- factor(with(rnaseq,sex[names(dp.age.group)]))
+    
+    q <- topGSdata %>%
+      group_by(GeneName,age.group) %>%
+      mutate(ho.score=ifelse(age.group=="HO" & sex=="Males",mean.score,Inf)) %>%
+      ungroup() %>%
+      arrange(ho.score) %>%
+      mutate(GeneName=factor(GeneName,levels=unique(.$GeneName))) %>% {
+        ggplot(.,aes(GeneName,mean.score)) +
+          geom_linerange(data = data.frame(.) %>%
+                           dcast(GeneName+sex~age.group,value.var = "mean.score"),
+                         aes(x=GeneName,ymin=HY,ymax=HO-sign(HO)*0,color=HO-HY,linetype=sex),
+                         size=1.5,
+                         # alpha=0.5,
+                         position=position_dodge(width = 0.5),
+                         inherit.aes = F) +
+          geom_label(aes(group=sex,label=age.group,fill=age.group),
+                     color="white",
+                     fontface="bold",
+                     size=ifelse(gs %in% c("Bcells","Inflammation I","Inflammation II"),1,ifelse(gs=="Monocytes",0.75,1.5)),
+                     position=position_dodge(width = 0.5),
+                     label.padding = unit(1.1,"pt"),
+                     label.size = 0.2) +
+          geom_hline(yintercept = 0,size=0.25,alpha=0.5,color="dimgray") +
+          # scale_color_manual(values = colors_sex,guide=F) + 
+          scale_color_gradient2(low = colors_age[levels(dp.age.group)[1]],mid = "gray80",high = colors_age[levels(dp.age.group)[2]]) +
+          scale_fill_manual(values = colors_age,guide=F) +
+          scale_linetype_manual(values = c(Females=1,Males=1),guide=F) +
+          scale_y_continuous(expand = expand_scale(mult = 0.075,add = 0)) +
+          facet_wrap(~sex) +
+          labs(x=NULL,
+               y="Normalized expression",
+               title="Sex- and cell-specific aging dynamic ranges",
+               subtitle=gs) +
+          coord_flip() +
+          theme_bw(base_size = 7) +
+          theme(aspect.ratio = 3.5,
+                strip.background = element_blank(),
+                strip.text = element_text(size=7,hjust=0),
+                # panel.spacing.x = unit(4,"lines"),
+                panel.grid.major.x = element_blank(),
+                panel.grid.minor.x = element_blank(),
+                axis.text.y = element_text(size=ifelse(gs %in% c("Bcells","Inflammation I","Inflammation II"),3,ifelse(gs=="Monocytes",1,5)),face = "italic"),
+                axis.title.x = element_text(size=10),
+                legend.position = "bottom")
+      }
+    print(q)
+    dev.off()
+  })
+})
+
+```
+
+
+
+```{r fig3d_arc_corr, fig.asp=1}
+# focus.hmm.enrichtest
+arc.da.glm_agebysex <- da.glm_agebysex.atac %>% 
+  select(peakco,logFC,logCPM,LR,PValue,FDR,Contrast) %>%
+  rename_at(vars(-peakco,-Contrast),funs(sub("$",".atac",.))) %>% 
+  inner_join(atac.allpeaks.anno.pbmc %>% 
+               select(-GeneType) %>% 
+               filter_at(vars(grep("chromHMMsimple",colnames(.))), any_vars(. %in% focus.hmm.enrichtest)),
+             by="peakco") %>%
+  select(chr,start,end,peakco,everything()) %>%
+  inner_join(da.glm_agebysex.rna %>% 
+               select(EnsemblID,logFC,logCPM,LR,PValue,FDR,Contrast) %>%
+               rename_at(vars(-EnsemblID,-Contrast),funs(sub("$",".rna",.))) %>% 
+               inner_join(anno.rna.pbmc %>% 
+                            select(-chr,-start,-strand),
+                          by="EnsemblID"),
+             by=c("GeneName","Contrast")) %>%
+  select(Contrast,chr,start,end,peakco,GeneName,EnsemblID,Annotation,DistancetoTSS,everything()) %>%
+  mutate(arc=abs(logFC.atac)*abs(logFC.rna))
+
+# Pooled data
+arc.da.glm_agebysex.nodups <- arc.da.glm_agebysex %>%
+  group_by(Contrast) %>%
+  arrange(GeneName,-arc) %>%
+  # arrange(GeneName,-abs(logFC.atac)) %>%
+  # arrange(GeneName,-logCPM.atac) %>%
+  # arrange(GeneName,abs(DistancetoTSS)) %>%
+  filter(!duplicated(GeneName)) %>%
+  group_by(Contrast) %>%
+  mutate(r=cor(logFC.atac,logFC.rna)) %>%
+  ungroup() %>%
+  mutate(sex=sub("_.*","",Contrast),
+         ageContrast=factor(sub(".*_","",Contrast),levels = c("Age2xAge1","Age3xAge2","Age3xAge1")))
+
+p <- ggplot(arc.da.glm_agebysex.nodups %>% 
+              filter(abs(DistancetoTSS)<=10e3,ageContrast=="Age3xAge1") %>%
+              group_by(sex) %>%
+              mutate(r=cor(logFC.atac,logFC.rna),
+                     P=cor.test(logFC.atac,logFC.rna)$p.value,
+                     sex.label=paste0(sex,"\n(",sprintf("r=%0.2f, ",r),sprintf("P=%0.3f",P),")"),
+                     GeneLabel=ifelse(arc>quantile(arc,0.995),GeneName,"")) %>%
+              ungroup() %>%
+              mutate(density=get_density(.$logFC.atac,.$logFC.rna,n = 200)),
+            aes(logFC.atac,logFC.rna,color=density)) +
+  geom_point(size=0.25,alpha=0.5,na.rm=T) +
+  geom_text_repel(aes(label=GeneLabel),size=2,fontface="italic",segment.size = 0.1,segment.alpha = 0.75,point.padding = 0.1,min.segment.length = 0,force = 0.75,color="black",na.rm = T) +
+  geom_smooth(method="lm",alpha=0.2,size=0.5,se = F,fullrange=T,color="tomato",na.rm=T) +
+  geom_hline(yintercept = 0,size=0.25,color="black",alpha=0.5) +
+  geom_vline(xintercept = 0,size=0.25,color="black",alpha=0.5) +
+  scale_color_gradientn(colors=parula(9),guide=guide_colorbar(title = "Value dens.",title.theme = element_text(size = 8,angle=0),label.theme = element_text(size = 6,angle = 0))) +
+  scale_x_continuous(limits = c(-2,2)) +
+  scale_y_continuous(limits = c(-2,2)) +
+  coord_equal() +
+  facet_wrap(~sex.label,nrow = 1) +
+  labs(x="HO-HY logFC, accessibility of regulatory element", 
+       y="HO-HY logFC, gene expression", 
+       title="Correlation between expression and accessibility of regulatory elements") +
+  theme_bw(base_size = 8) +
+  theme(strip.background = element_blank(),
+        panel.grid.minor = element_blank())
+ggsave(plot = p,filename = "./Fig3/fig3_arc_logfc.pdf")
+ggsave(plot = p,filename = "./Fig3/fig3_arc_logfc.tiff",bg="transparent")
+
+```
+
+
+```{r fig3e_logfc_dist, fig.asp=1}
+
+p <- ggplot(da.glm_agebysex.rna %>% 
+              mutate(SexContrast=sub("\\_.*","",Contrast),
+                     direction=ifelse(logFC<0,"Closing peaks","Opening peaks")) %>%
+              inner_join(anno.rna.pbmc %>% select(EnsemblID,GeneName), by="EnsemblID") %>%
+              inner_join(with(gsenv,merge(geneset.names.scrnaseq_pbmc_simple_specific,geneset.genes.scrnaseq_pbmc_simple_specific,by="Module.ID")) %>% 
+                           select(GeneName,Specificity="Module.Name") %>%
+                           filter(!is.na(Specificity)),
+                         by="GeneName") %>% 
+              mutate(Specificity=ifelse(grepl("^B",Specificity),"CD19",
+                                        ifelse(grepl("^NK",Specificity),"CD56",
+                                               ifelse(grepl("^Mono",Specificity),"CD14",Specificity))),
+                     Specificity=factor(ifelse(Specificity %in% c(focus.celltypes,"Naive_Tcells","acCD8_Tcells","Tcells"),Specificity,"Other")),
+                     direction=sub(" in$","",direction)) %>%
+              group_by(SexContrast,Specificity) %>%
+              mutate(n=n()) %>%
+              ungroup() %>%
+              mutate(Specificity=factor(Specificity,levels = c(focus.celltypes,"Naive_Tcells","acCD8_Tcells","Tcells","Other")),
+                     label=factor(paste0(Specificity,"\nn = ",n))) %>%
+              mutate(label=factor(label,levels = levels(label)[c(2,4,3,5,7,1,6)])),
+            aes(label,logFC,fill=SexContrast,color=SexContrast)) +
+  geom_split_violin(draw_quantiles = 0.5,trim = F,alpha=0.5,size=0.25) +
+  geom_point(size=0.2,position=position_jitterdodge(dodge.width = -0.1,jitter.width = 0.05),alpha=0.25) +
+  stat_compare_means(aes(group=SexContrast), size=3, label.y = 2, label = "p.signif",vjust = 0) +
+  geom_hline(yintercept = 0,color="firebrick4",size=0.1,alpha=0.75,linetype=2) +
+  labs(y="logFC, HO-HY",
+       x=NULL,
+       title="Sex-specific logFC distribution of cell-specific regulatory elements",
+       caption="* P<0.01, ** P<0.001, ***P<0.0001") +
+  scale_fill_manual(values = colors_sex,guide=guide_legend(title = NULL)) +
+  scale_color_manual(values = colors_sex,guide=F) +
+  theme_bw(base_size = 11) +
+  theme(aspect.ratio = 0.75,
+        plot.title = element_text(hjust=0),
+        # axis.text.y = element_blank(),
+        strip.background = element_blank(),
+        strip.text.y = element_text(angle=0,hjust=0),
+        legend.position = "bottom",
+        legend.key.size = unit(0.5,"lines"),
+        panel.spacing = unit(0,"points"),
+        plot.caption = element_text(size=6,face="italic"))
+ggsave(p,filename = "./Fig3/fig3_logfc.cellspecific_agebysex.pdf")
+
+```
+
+```{r fig3f_venn_rna, fig.asp=1}
+
+# Gene hits, list form
+da.glm_agebysex.do.rna <- da.glm_agebysex.rna %>% 
+  filter(FDR<=fdr.thresh.rna) %>% 
+  inner_join(anno.rna.pbmc,by="EnsemblID") %>%
+  split(.,f = .$Contrast)
+
+# Venn diagrams, peak-wise
+da.glm_venn_bygene <- lapply(setNames(as.list(c("Females","Males")),c("Females","Males")), function(sx) {
+    allGenes <- unique(sort(da.glm_agebysex.do.rna[[paste(sx,"Age3xAge1",sep="_")]]$EnsemblID))
+    dirGenes <- lapply(setNames(as.list(c(1,-1)),c("upregulated","downregulated")), function(d) {
+      dirGenes = unique(sort(subset(da.glm_agebysex.do.rna[[paste(sx,"Age3xAge1",sep="_")]],sign(logFC)==d)$EnsemblID))
+    })
+    return(list(all=allGenes,up=dirGenes$upregulated,down=dirGenes$downregulated))
+  })
+genesVenn_bygene <- lapply(setNames(as.list(c("all","down","up")),c("all","down","up")), function(ds) {
+  v <- Venn(lapply(da.glm_venn_bygene,`[[`,ds))
+  colnames(v@IndicatorWeight) <- sub("ales$",paste0("ales_",ds),colnames(v@IndicatorWeight))
+  return(v)
+})
+pdf("./Fig3/fig3_venn_agebysex.pdf")
+  da.glm_venn_bygene.plots <- sapply(da.glm_venn_bygene,function(X) {
+    sapply(genesVenn_bygene, function(V) {
+      if (sum(V@IndicatorWeight[,3]>0)<=1) return(NULL)
+      plot(V)
+    })
+  })
+dev.off()
+
+```
+
+```{r fig3g_browser.shots, fig.asp=1}
+
+query_dir <- "../../Jax/PBMC/DifferentialAnalysis/manuscripts/aging-02/figures/browser.shots/queries/"
+query.list <- lapply(as.list(sapply(sub("\\.qry","",dir(query_dir,pattern = "query.?.qry")),function(x) x)), function(q) {
+  read.table(paste0(query_dir,q,".qry"),sep = "\t",header = F,quote = "",col.names = c("chr.ref","start.ref","end.ref","GeneName","Specificity"),stringsAsFactors = F) %>%
+    distinct()
+})
+# gene_list <- unique(as.character(do.call(c,lapply(query.list,`[[`,"GeneName"))))
+gene_list <- c("CD8A","CD79A","CD79B","GNLY","GZMB","GZMK","IL7R","IL18","S100A8","S100A9","TCF7")
+
+# Window (whole-region) shots
+gene_window_bs <- lapply(setNames(as.list(gene_list),gene_list), function(gene_query) {
+  query_info <- lapply(query.list,function(Q) Q %>% filter(GeneName==gene_query))
+  query_info <- query_info[sapply(query_info,function(q) nrow(q)>0)][1]
+  browser_shot(gene_query = gene_query,
+               query_path = paste(query_dir,names(query_info),sep = "/"),
+               bedgraph_dir = paste0("/Volumes/emback/temp/bedGraph_queries/",names(query_info)),
+               ref_flank = 2.5e5,
+               nref_peaks = 1,
+               refpeak_fdr.cutoff=0.1,
+               atac.anno = atac.allpeaks.anno.pbmc,
+               glm.results = da.glm_agebysex.atac %>%
+                 mutate(SexContrast=sub("\\_.*","",Contrast)) %>% 
+                 dplyr::select(grep("^Contrast",colnames(.),invert = T)) %>%
+                 split(.,f = .$SexContrast) %>%
+                 lapply(., function(X) X %>% column_to_rownames("peakco") %>% dplyr::select(-SexContrast)),
+               glm.dge = atacseq$da_bysex[[1]]$da.list$dge,
+               atac.adj = adj.data.atac %>% dplyr::select(peakco,atacseq$sampid) %>% column_to_rownames("peakco"),
+               rna.adj = adj.data.rna %>% dplyr::select(EnsemblID,rnaseq$sampid) %>% column_to_rownames("EnsemblID"),
+               valid.samps = with(atacseq,samps[age.group!="HM"]),
+               samp.stats = with(atacseq,data.frame(sampid,sex,age.group,age,batchdate,libsize=libsize.atac.pbmc,stringsAsFactors = F)),
+               draw.plot=T,
+               gpar=list(scanby="window",
+                         rangex=c(-10000,10000),
+                         group.order = c("HY","HM","HO"),
+                         plot.style = "line",
+                         plot.se=T,
+                         area.alpha = 0.5,
+                         thinning.bw = 10,
+                         chrtrack.nudge=0.25,
+                         arrow.nudge = 0,
+                         arrow.freq = 10,
+                         bpaxistitlehjust = -1,
+                         grobwunit = 3.5,
+                         grobhunit = 0.5,
+                         max.fp = 10),
+               query_peaks_focus=T,
+               include_allcs=T,
+               include_footprints=F,
+               output_dir="../../SexDifferences/Figures/Fig3/bs/",
+               bedtools_path = "/Users/emarquez/seqanal/bedtools-2.17.0/bin")
+})
+
+# Focused shots
+gene_ranges <- list(IL7R=c(-7000,-14000),
+                    CD79A=c(-3000,1000),
+                    CD79B=c(-6000,1000),
+                    CD8A=c(-3000,1000),
+                    CD14=c(-5000,1000),
+                    S100A8=c(-5000,1000),
+                    S100A9=c(-5000,5000),
+                    GNLY=c(-4000,10000),
+                    GZMB=c(-10000,50000),
+                    GZMK=c(-5000,30000),
+                    FCGR3A=c(-1000,15000),
+                    FCGR3B=c(-1000,15000),
+                    CCR7=c(-10000,5000),
+                    IRF4=c(-45000,-10000),
+                    IGLL5=c(-4000,-7000),
+                    TCF7=c(-35000,-7000),
+                    ZSCAN18=c(0,1000),
+                    FLNB=c(-15000,-80000),
+                    SATB1=c(70000,15000),
+                    PDK1=c(-110000,-25000),
+                    CXCR5=c(-10000,30000),
+                    PITPNC1=c(-20000,-200000),
+                    UBTF=c(7500,10000),
+                    CD27=c(-50000,-3000),
+                    TRPV3=c(-5000,5000),
+                    ZNF608=c(60000,10000),
+                    CCDC109B=c(-25000,-25000),
+                    BTBD11=c(-50000,-125000),
+                    IL18=c(-30000,2500))
+
+gene_tss_bs <- lapply(setNames(as.list(gene_list),gene_list), function(gene_query) {
+  query_info <- lapply(query.list,function(Q) Q %>% filter(GeneName==gene_query))
+  query_info <- query_info[sapply(query_info,function(q) nrow(q)>0)][1]
+  browser_shot(gene_query = gene_query,
+               query_path = paste(query_dir,names(query_info),sep = "/"),
+               bedgraph_dir = paste0("/Volumes/emback/temp/bedGraph_queries/",names(query_info)),
+               ref_flank = 2.5e5,
+               nref_peaks = 1,
+               refpeak_fdr.cutoff=0.1,
+               atac.anno = atac.allpeaks.anno.pbmc,
+               glm.results = da.glm_agebysex.atac %>%
+                 mutate(SexContrast=sub("\\_.*","",Contrast)) %>% 
+                 dplyr::select(grep("^Contrast",colnames(.),invert = T)) %>%
+                 split(.,f = .$SexContrast) %>%
+                 lapply(., function(X) X %>% column_to_rownames("peakco") %>% dplyr::select(-SexContrast)),
+               glm.dge = atacseq$da_bysex[[1]]$da.list$dge,
+               atac.adj = adj.data.atac %>% dplyr::select(peakco,atacseq$sampid) %>% column_to_rownames("peakco"),
+               rna.adj = adj.data.rna %>% dplyr::select(EnsemblID,rnaseq$sampid) %>% column_to_rownames("EnsemblID"),
+               valid.samps = with(atacseq,samps[age.group!="HM"]),
+               samp.stats = with(atacseq,data.frame(sampid,sex,age.group,age,batchdate,libsize=libsize.atac.pbmc,stringsAsFactors = F)),
+               draw.plot=T,
+               gpar=list(scanby="tss",
+                         rangex=gene_ranges[[gene_query]],
+                         group.order = c("HY","HM","HO"),
+                         plot.style = "line",
+                         plot.se=T,
+                         area.alpha = 0.5,
+                         thinning.bw = 10,
+                         chrtrack.nudge=0.25,
+                         arrow.nudge = 0,
+                         arrow.freq = 10,
+                         bpaxistitlehjust = -1,
+                         grobwunit = 3.5,
+                         grobhunit = 0.5,
+                         max.fp = 10),
+               query_peaks_focus=T,
+               include_allcs=T,
+               include_footprints=F,
+               output_dir="../../SexDifferences/Figures/Fig3/bs/",
+               bedtools_path = "/Users/emarquez/seqanal/bedtools-2.17.0/bin")
+})
+
+```
+
+
+
+## Module heatmaps and dynamic ranges based on extended set of gene sets (unused)
+
+```{r fig3c_geneset_heatmaps_comprehensive}
+
+# Module Heatmaps
+da_heatmaps.fname = paste0("./data-repo/rna.da_enrichment_heatmaps_comprehensive.RData")
+
+if (da_heatmaps.fname %in% dir(recursive = T,full.names = T)) {
+  load(da_heatmaps.fname)
+} else {
+  adjplots <- lapply(setNames(as.list(names(rna_tested.modules_agebysex)),names(rna_tested.modules_agebysex)),function(n) {
+    print(n[[1]])
+    hm <- lapply(setNames(as.list(names(rna_tested.modules_agebysex[[n]])),names(rna_tested.modules_agebysex[[n]])), function(gs) {
+      print(gs[[1]])
+      X <- rna_tested.modules_agebysex[[n]][[gs]]
+      
+      # Heatmap by sample
+      pdf(paste("./Fig3/hm/fig3_rna.do.heatmaps",gs,sub("\\n.*","",n),"agebysex.pdf",sep="_"))
+        topGSnames <- X$top %>% distinct(Module.Name)
+        transcription <- da.glm_agebysex.rna %>% filter(FDR<=fdr.thresh.rna,Contrast_label==n) %>% inner_join(anno.rna.pbmc,by="EnsemblID")
+        topGS <- (with(X$geneset,merge(genes,names,by="Module.ID") %>% select(-Module.ID)) %>% split(.,f=.$Module.Name))[topGSnames$Module.Name]
+        topGSdata <- lapply(setNames(as.list(names(topGS)),names(topGS)), function(g) {
+          print(g)
+          commonGenes = intersect(topGS[[g]]$GeneName,transcription$GeneName)
+          if (!length(commonGenes)) return(NULL)
+          data.frame(GeneName=commonGenes,Module.Name=g) %>%
+            merge(.,transcription,by="GeneName") %>%
+            arrange(GeneName,PValue) %>%
+            filter(!duplicated(GeneName)) %>%
+            merge(adj.data.rna %>% select(EnsemblID,rnaseq$samps),by="EnsemblID")
+        })
+        topGSdata <- topGSdata[!sapply(topGSdata,is.null)]
+        if (!length(topGSdata)) return(NULL)
+        topGSdata <- topGSdata[sapply(topGSdata,function(x) nrow(x)>2)]
+        
+        omitage <- c("HY","HM","HO")[!sapply(c("Age1","Age2","Age3"),function(s) grepl(s,n))]
+        hm.age.group <- factor(with(rnaseq,age.group[age.group!=omitage]))
+        hm.age <- with(rnaseq,age[names(hm.age.group)])
+        hm.sex <- factor(with(rnaseq,sex[names(hm.age.group)]))
+        
+        topheatmaps <- lapply(topGSdata, function(Z) {
+          g = as.character(Z$Module.Name[1])
+          print(g)
+          
+          hm.females <- Z %>% 
+            select(GeneName,names(hm.sex)[hm.sex=="F"][order(hm.age[hm.sex=="F"])]) %>% 
+            column_to_rownames("GeneName") %>% apply(.,1,function(x) (x-mean(x))/sd(x)) %>% 
+            t()
+          hm.fanno <- HeatmapAnnotation(boxplot = anno_boxplot(hm.females,border = F,gp = gpar(fill=colors_sex[["F"]],alpha=0.5),size = unit(0.5,"mm")),
+                                        with(rnaseq,data.frame(age.group,sex,stringsAsFactors = F)[colnames(hm.females),] %>% select(-sex)),
+                                        col = list(age.group=colors_age),
+                                        show_legend = F,
+                                        height=unit(15,"mm"),
+                                        gap = unit(1,"mm"),
+                                        which = "column")
+          hm.males <- Z %>% 
+            select(GeneName,names(hm.sex)[hm.sex=="M"][order(hm.age[hm.sex=="M"])]) %>% 
+            column_to_rownames("GeneName") %>% apply(.,1,function(x) (x-mean(x))/sd(x)) %>% 
+            t()
+          hm.manno <- HeatmapAnnotation(boxplot = anno_boxplot(hm.males,border = F,gp = gpar(fill=colors_sex[["M"]],alpha=0.5),size = unit(0.5,"mm")),
+                                        with(rnaseq,data.frame(age.group,sex,stringsAsFactors = F)[colnames(hm.males),] %>% select(-sex)),
+                                        col = list(age.group=colors_age),
+                                        show_legend = F,
+                                        height=unit(15,"mm"),
+                                        gap = unit(1,"mm"),
+                                        which = "column")
+          
+          
+          
+          hm.rowclust <- if (grepl("Females",n,ignore.case = T)) {
+            hclust(corDist(hm.females),method="complete")
+          } else {
+            hclust(corDist(hm.males),method="complete")
+          }
+          hm.rowanno <- rowAnnotation((Z %>% 
+                                         select(GeneName,logFC) %>% 
+                                         mutate(direction=ifelse(logFC<0,"Closing","Opening")) %>% 
+                                         tibble::column_to_rownames("GeneName"))[hm.rowclust$labels,],
+                                      col = list(direction=c(Closing="#3360a4",Opening="firebrick3"),
+                                                 logFC=circlize::colorRamp2(brewer.rdylgn(100),breaks = seq(-1,1,length.out = 100))),
+                                      width=unit(4,"mm"))
+          hmf <- Heatmap(hm.females,
+                         col = colorRampPalette(colors_redblu10)(100),
+                         column_names_gp = gpar(fontsize=7),
+                         na_col = "gainsboro",
+                         column_title = "Females",
+                         cluster_rows = hm.rowclust,
+                         cluster_columns = F,
+                         show_row_dend = F,
+                         top_annotation = hm.fanno,
+                         show_row_names = F,
+                         show_heatmap_legend = F,
+                         split = 2)
+          hmm <- Heatmap(hm.males,
+                         col = colorRampPalette(colors_redblu10)(100),
+                         row_names_gp = gpar(fontsize=6,fontface="italic"),
+                         column_names_gp = gpar(fontsize=7),
+                         name = g,
+                         na_col = "gainsboro",
+                         column_title = "Males",
+                         cluster_rows = hm.rowclust,
+                         cluster_columns = F,
+                         show_row_dend = F,
+                         top_annotation = hm.manno,
+                         split = 2)
+          hm_list <- Heatmap(matrix(nrow = nrow(Z),ncol = 0),cluster_rows = hm.rowclust,split=2) + hm.rowanno + hmf + hmm
+          draw(hm_list,gap = unit(1,"mm"))
+          
+          saveobj <- setNames(list(hm.females,hm.fanno,hm.males,hm.manno,hm.rowclust,hm.rowanno,hm_list),c("hm.females","hm.fanno","hm.males","hm.manno","hm.rowclust","hm.rowanno","hm_list"))
+          return(saveobj)
+        })
+      dev.off()
+      
+      # Heatmap of median expression by age and sex
+      pdf(paste("./Fig3/hm/fig3_rna.do.heatmaps.summary",gs,sub("\\n.*","",n),"agebysex.pdf",sep="_"),paper = "us",height = 11)
+        topGSnames <- X$top %>% distinct(Module.Name)
+        transcription <- da.glm_agebysex.rna %>% filter(FDR<=fdr.thresh.rna,Contrast_label==n) %>% inner_join(anno.rna.pbmc,by="EnsemblID")
+        topGS <- (with(X$geneset,merge(genes,names,by="Module.ID") %>% select(-Module.ID)) %>% split(.,f=.$Module.Name))[topGSnames$Module.Name]
+        topGSdata <- lapply(setNames(as.list(names(topGS)),names(topGS)), function(g) {
+          print(g)
+          commonGenes = intersect(topGS[[g]]$GeneName,transcription$GeneName)
+          if (!length(commonGenes)) return(NULL)
+          data.frame(GeneName=commonGenes,Module.Name=g) %>%
+            merge(.,transcription,by="GeneName") %>%
+            arrange(GeneName,PValue) %>%
+            filter(!duplicated(GeneName)) %>%
+            merge(adj.data.rna %>% select(EnsemblID,rnaseq$samps),by="EnsemblID")
+        })
+        topGSdata <- topGSdata[!sapply(topGSdata,is.null)]
+        if (!length(topGSdata)) return(NULL)
+        topGSdata <- topGSdata[sapply(topGSdata,function(x) nrow(x)>2)]
+        sumheatmaps <- lapply(topGSdata, function(Z) {
+          g = as.character(Z$Module.Name[1])
+          print(g)
+          
+          hm.females <- Z %>% 
+            select(GeneName,names(hm.sex)[hm.sex=="F"][order(hm.age[hm.sex=="F"])]) %>% 
+            column_to_rownames("GeneName") %>% 
+            t() %>%
+            data.frame() %>%
+            rownames_to_column("sampid") %>%
+            mutate_at(vars(-sampid),funs((.-mean(.))/sd(.))) %>% 
+            inner_join(data.frame(age.group=hm.age.group,sex=hm.sex) %>% rownames_to_column("sampid"),by="sampid") %>%
+            group_by(age.group,sex) %>%
+            summarize_at(vars(-sampid),list(~median)) %>%
+            ungroup() %>%
+            mutate(sex=ifelse(sex=="F","Females","Males")) %>%
+            select(-sex) %>%
+            data.frame(.,row.names="age.group") %>%
+            t()
+          hm.fanno <- HeatmapAnnotation(boxplot = anno_boxplot(hm.females,border = F,gp = gpar(fill=colors_sex[["F"]],alpha=0.5,col=colorRampPalette(c(colors_sex[["F"]],"black"))(10)[6],lwd=1.5),size=unit(0.5,"mm")),
+                                        # with(rnaseq,data.frame(age.group,age,sex,stringsAsFactors = F) %>% 
+                                        #        mutate(sex=ifelse(sex=="F","Females","Males")) %>% 
+                                        #        filter(sex=="Females",age.group!="HM") %>% 
+                                        #        group_by(age.group) %>% 
+                                        #        summarize(median_age=median(age)) %>% 
+                                        #        ungroup()) %>%
+                                        #   data.frame(.,row.names = .$age.group) %>%
+                                        #   select(-median_age),
+                                        # col = list(age.group=colors_age),
+                                        show_legend = F,
+                                        height=unit(15,"mm"),
+                                        gap = unit(1,"mm"),
+                                        which = "column")
+          
+          hm.males <- Z %>% 
+            select(GeneName,names(hm.sex)[hm.sex=="M"][order(hm.age[hm.sex=="M"])]) %>% 
+            column_to_rownames("GeneName") %>% 
+            t() %>%
+            data.frame() %>%
+            rownames_to_column("sampid") %>%
+            mutate_at(vars(-sampid),funs((.-mean(.))/sd(.))) %>% 
+            inner_join(data.frame(age.group=hm.age.group,sex=hm.sex) %>% rownames_to_column("sampid"),by="sampid") %>%
+            group_by(age.group,sex) %>%
+            summarize_at(vars(-sampid),list(~median)) %>%
+            ungroup() %>%
+            mutate(sex=ifelse(sex=="F","Females","Males")) %>%
+            select(-sex) %>%
+            data.frame(.,row.names="age.group") %>%
+            t()
+          hm.manno <- HeatmapAnnotation(boxplot = anno_boxplot(hm.males,border = F,gp = gpar(fill=colors_sex[["M"]],alpha=0.5,col=colorRampPalette(c(colors_sex[["M"]],"black"))(10)[6],lwd=1.5),size=unit(0.5,"mm")),
+                                        # with(rnaseq,data.frame(age.group,age,sex,stringsAsFactors = F) %>% 
+                                        #        mutate(sex=ifelse(sex=="F","Females","Males")) %>% 
+                                        #        filter(sex=="Males",age.group!="HM") %>% 
+                                        #        group_by(age.group) %>% 
+                                        #        summarize(median_age=median(age)) %>% 
+                                        #        ungroup()) %>%
+                                        #   data.frame(.,row.names = .$age.group) %>%
+                                        #   select(-median_age),
+                                        # col = list(age.group=colors_age),
+                                        show_legend = F,
+                                        height=unit(15,"mm"),
+                                        gap = unit(1,"mm"),
+                                        which = "column")
+          
+          hm.rowclust <- if (grepl("Females",n,ignore.case = T)) {
+            hclust(dist(hm.females),method="complete")
+          } else {
+            hclust(dist(hm.males),method="complete")
+          }
+          
+          hmf <- Heatmap(hm.females,
+                         col = colorRampPalette(colors_redblu10)(100),
+                         column_names_gp = gpar(fontsize=12),
+                         column_names_side = "bottom",
+                         na_col = "gainsboro",
+                         column_title = "Females",
+                         cluster_rows = hm.rowclust,
+                         rect_gp = gpar(col = "bisque", lwd = 1.5),
+                         cluster_columns = F,
+                         show_row_dend = T,
+                         top_annotation = hm.fanno,
+                         show_row_names = F,
+                         top_annotation_height = unit(3,"lines"),
+                         show_heatmap_legend = F,
+                         width=unit(5,"lines"))
+          hmm <- Heatmap(hm.males,
+                         col = colorRampPalette(colors_redblu10)(100),
+                         row_names_gp = gpar(fontsize=6,fontface="italic"),
+                         column_names_gp = gpar(fontsize=12),
+                         name = paste(g,"(z-score)"),
+                         column_names_side = "bottom",
+                         na_col = "gainsboro",
+                         column_title = "Males",
+                         cluster_rows = hm.rowclust,
+                         rect_gp = gpar(col = "bisque", lwd = 1.5),
+                         cluster_columns = F,
+                         show_row_dend = F,
+                         top_annotation = hm.manno,
+                         show_row_names = T,
+                         top_annotation_height = unit(3,"lines"),
+                         show_heatmap_legend = T,
+                         width=unit(5,"lines"))
+          hm_list <- hmf + hmm
+          draw(hm_list,gap = unit(1,"mm"))
+          
+          saveobj <- setNames(list(hm.females,hm.fanno,hm.males,hm.manno,hm.rowclust,hm.rowanno,hm_list),c("hm.females","hm.fanno","hm.males","hm.manno","hm.rowclust","hm.rowanno","hm_list"))
+          return(saveobj)
+        })
+      dev.off()
+      
+      return(list(bysamp=topheatmaps,summary=sumheatmaps))
+    })
+    return(hm)
+  })
+  save(adjplots,file = da_heatmaps.fname)
+}
+
+```
+
+```{r fig3c_dynamic_range_plots_comprehensive}
+
+expression.summary <- adj.data.rna %>% 
+    melt(.,measure.vars=rnaseq$samps,variable.name="sampid",value.name="adj.score") %>%
+    mutate(sampid=as.character(sampid)) %>%
+    inner_join(with(rnaseq,data.frame(sampid,sex,age,age.group,stringsAsFactors = F)),by="sampid") %>%
+    mutate(grand.mean.score=mean(adj.score)) %>%
+    group_by(EnsemblID) %>%
+    mutate(norm.score=znorm(adj.score)) %>%
+    group_by(EnsemblID,GeneName,age.group,sex) %>%
+    summarize(mean.score=mean(norm.score),
+              grand.mean.score=mean(grand.mean.score)) %>%
+    ungroup() %>%
+    mutate(sex=plyr::mapvalues(sex,from = c("F","M"),to = c("Females","Males"))) %>%
+    inner_join(da.glm_agebysex.rna %>%
+                 mutate(sex=relevel(factor(sub("\\_.*","",Contrast)),ref="Females"),
+                        AgeContrast=sub("Age3","HO",sub("Age2","HM",sub("Age1","HY",sub(".*\\_","",Contrast))))),
+               by=c("EnsemblID","sex")) %>%
+    mutate(isMatch=apply(.,1,function(X) grepl(X["age.group"],X["AgeContrast"]))) %>%
+    filter(isMatch) %>%
+    select(-isMatch)
+
+dyrgeplots <- lapply(setNames(as.list(names(rna_tested.modules_agebysex)),names(rna_tested.modules_agebysex)),function(n) {
+  print(n[[1]])
+  lapply(setNames(as.list(names(rna_tested.modules_agebysex[[n]])),names(rna_tested.modules_agebysex[[n]])), function(gs) {
+    print(gs[[1]])
+    X <- rna_tested.modules_agebysex[[n]][[gs]]
+    topGSnames <- X$top %>% distinct(Module.Name)
+    topGS <- (with(X$geneset,merge(genes,names,by="Module.ID") %>% select(-Module.ID)) %>% split(.,f=.$Module.Name))[topGSnames$Module.Name]
+    
+    pdf(paste("./Fig3/dr/fig3_rna.dynamic.range.plots",gs,sub("\\n.*","",n),"agebysex.pdf",sep="_"),paper = "us",height = 11)
+    
+      topGSdata <- lapply(setNames(as.list(names(topGS)),names(topGS)), function(g) {
+        print(g)
+        commonGenes = intersect(topGS[[g]]$GeneName,expression.summary$GeneName)
+        if (!length(commonGenes)) return(NULL)
+        expression.summary %>%
+          filter(GeneName %in% commonGenes) %>%
+          group_by(GeneName) %>%
+          mutate(minP=min(PValue),
+                 minFDR=min(FDR)) %>%
+          ungroup() %>%
+          mutate(mean.rescore=mean.score+grand.mean.score) %>%
+          arrange(age.group,sex,GeneName,-logCPM) %>%
+          filter(!duplicated(paste(age.group,sex,GeneName))) %>%
+          mutate(schema=gs,
+                 geneset=g) %>%
+          mutate(schema.Label=plyr::mapvalues(factor(schema, levels = c("scrnaseq_pbmc_simple_specific","dice_major","vp2008","wp")),
+                                              from = c("scrnaseq_pbmc_simple_specific","dice_major","vp2008","wp"),
+                                              to = paste("Source:",c("scRNAseq clusters","DICE cell-specific expression","Immune modules","Wikipathways"))))
+      })
+      topGSdata <- topGSdata[!sapply(topGSdata,is.null)]
+      if (!length(topGSdata)) return(NULL)
+      topGSdata <- topGSdata[sapply(topGSdata,function(x) nrow(x)>2)]
+      
+      omitage <- c("HY","HM","HO")[!sapply(c("Age1","Age2","Age3"),function(s) grepl(s,n))]
+      dp.age.group <- factor(with(rnaseq,age.group[age.group!=omitage]))
+      dp.sex <- factor(with(rnaseq,sex[names(dp.age.group)]))
+      
+      output <- lapply(topGSdata, function(Z) {
+        sc =  Z$schema.Label[1]
+        gset = Z$geneset[1]
+        q <- Z %>% #{
+          group_by(GeneName,age.group) %>%
+          mutate(ho.score=ifelse(age.group=="HO",mean.score,Inf)) %>%
+          ungroup() %>%
+          arrange(ho.score) %>%
+          mutate(GeneName=factor(GeneName,levels=unique(.$GeneName))) %>% {
+            ggplot(.,aes(GeneName,mean.score)) +
+              geom_linerange(data = data.frame(.) %>%
+                               dcast(GeneName+sex~age.group,value.var = "mean.score"),
+                             aes(x=GeneName,ymin=HY,ymax=HO-sign(HO)*0,color=HO-HY,linetype=sex),
+                             size=1.5,
+                             # alpha=0.5,
+                             position=position_dodge(width = 0.5),
+                             inherit.aes = F) +
+              geom_label(aes(group=sex,label=age.group,fill=age.group),
+                         color="white",
+                         fontface="bold",
+                         size=2,
+                         position=position_dodge(width = 0.5),
+                         label.padding = unit(1.25,"pt"),
+                         label.size = 0.2) +
+              geom_hline(yintercept = 0,size=0.25,alpha=0.5,color="dimgray") +
+              # scale_color_manual(values = colors_sex,guide=F) + 
+              scale_color_gradient2(low = colors_age[levels(dp.age.group)[1]],mid = "gray80",high = colors_age[levels(dp.age.group)[2]]) +
+              scale_fill_manual(values = colors_age,guide=F) +
+              scale_linetype_manual(values = c(Females=1,Males=1),guide=F) +
+              scale_y_continuous(expand = expand_scale(mult = 0.075,add = 0)) +
+              facet_wrap(~sex) +
+              labs(x=NULL,
+                   y="Normalized expression",
+                   title="Sex- and cell-specific aging dynamic ranges",
+                   subtitle=paste0(sc,", ",gset," gene set")) +
+              coord_flip() +
+              theme_bw(base_size = 8) +
+              theme(aspect.ratio = 3.5,
+                    strip.background = element_blank(),
+                    strip.text = element_text(size=10,hjust=0),
+                    # panel.spacing.x = unit(4,"lines"),
+                    panel.grid.major.x = element_blank(),
+                    panel.grid.minor.x = element_blank(),
+                    axis.title.x = element_text(size=12),
+                    legend.position = "bottom")
+          }
+        print(q)
+      })
+    dev.off()
+  })
+})
+
+```

@@ -1,0 +1,794 @@
+---
+title: "Fig4"
+author: "Eladio J Marquez"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list = ls())
+
+library(Biobase)
+library(pals)
+library(scales)
+library(ggplot2)
+library(ggrepel)
+library(DescTools)
+library(tibble)
+library(reshape2)
+library(dplyr)
+
+# Loads ATAC data
+peak.set = "narrow"
+run.name="AgexSex_homo" # Age|AgexSex|AgexSex_homo
+batch.variable="batchdate" # batchdate|rebatch
+
+atac_data <- load(paste0("./data-repo/pbmc_aging.summer2017_",peak.set,"Peaks_filtered.RData"))
+atacseq <- new.env()
+atac_stats <- load(paste0("./data-repo/aging.summer2017_filtered_global.stats_",peak.set,"Peaks_filtered.RData"),envir = atacseq)
+da_output <- load(paste0("./data-repo/da_output_",run.name,"_",batch.variable,"_",peak.set,"Peaks","_BySex.RData"),envir = atacseq)
+adj.data.atac <- lapply(lapply(atacseq$da_bysex,`[[`,"da.list"),`[[`,"adj")[[1]] %>%
+  data.frame(.) %>%
+  rownames_to_column("peakco") %>%
+  inner_join(atac.allpeaks.anno.pbmc,.,by="peakco")
+
+# Expression data
+rna_data <- load("./data-repo/pbmc_aging.summer2017_RNA_filtered.RData")
+rnaseq <- new.env()
+rna_stats <- load(paste0("./data-repo/aging.summer2017_filtered_global.stats_RNA_filtered.RData"),envir = rnaseq)
+da_output.rna <- load(paste0("./data-repo/da_output_",run.name,"_",batch.variable,"_RNA_BySex.RData"),envir = rnaseq)
+adj.data.rna <- lapply(lapply(rnaseq$da_bysex,`[[`,"da.list"),`[[`,"adj")[[1]] %>%
+  data.frame(.) %>%
+  rownames_to_column("EnsemblID") %>%
+  inner_join(anno.rna.pbmc,.,by="EnsemblID")
+
+# Global parameters
+fdr.thresh = 0.05
+fdr.thresh.rna = 0.1
+pflank = 2000
+min.expressed = 3
+geneset.path = "./data-repo/geneset.info.RData"
+min.modgenes = 5
+gene.uni <- sort(unique((expressed.pbmc %>% mutate(EnsemblID=rownames(.)) %>% filter(Total.counts>=min.expressed) %>% inner_join(anno.rna.pbmc,by="EnsemblID"))$GeneName))
+fdr.thresh.enrichtest = 0.05
+focus.celltypes <- c("PBMC","CD14","CD56","CD19","CD4_naive","CD4_memory","CD8_naive","CD8_memory")
+ntop.gs = 15 # max number of gene sets to show for either down or up directions
+maxlogP = 20 # truncate larger loginvP values to this value, used in enrichment plots
+
+# Load annotation gene sets
+gsenv = new.env() 
+genesets <- load(geneset.path,envir = gsenv)
+
+# External+helper scripts
+source("./scripts/grafx_functions.R")
+source("./scripts/ms_colors.R")
+
+# Chromatin accessibility & expression differential anaysis results
+da.glm_agebysex.atac <- do.call(rbind,lapply(names(atacseq$da_bysex), function(n) {
+  atacseq$da_bysex[[n]]$da.list$glm %>%
+    rownames_to_column("peakco") %>%
+    mutate(Contrast=n)
+})) %>%
+  filter(!grepl("Age2",Contrast)) %>%
+  mutate(Contrast_color=ifelse(FDR<=fdr.thresh,ifelse(logFC<0,ifelse(grepl("Age1",.$Contrast),colors_age["Age1"],colors_age["Age2"]),ifelse(grepl("Age3",.$Contrast),colors_age["Age3"],colors_age["Age2"])),"black")) %>%
+  group_by(Contrast) %>%
+  mutate(nhits=sum(FDR<=fdr.thresh)) %>%
+  ungroup() %>%
+  mutate(Contrast_label=factor(paste0(Contrast,"\n(n=",nhits," hits)"))) %>%
+  mutate(Contrast_label=factor(Contrast_label,levels = levels(.$Contrast_label)[c(1,3,2,4,6,5)]))
+
+da.glm_agebysex.rna <- do.call(rbind,lapply(names(rnaseq$da_bysex), function(n) {
+  rnaseq$da_bysex[[n]]$da.list$glm %>%
+    rownames_to_column("EnsemblID") %>%
+    mutate(Contrast=n)
+})) %>%
+  filter(!grepl("Age2",Contrast)) %>%
+  mutate(Contrast_color=ifelse(FDR<=fdr.thresh.rna,ifelse(logFC<0,ifelse(grepl("Age1",.$Contrast),colors_age["Age1"],colors_age["Age2"]),ifelse(grepl("Age3",.$Contrast),colors_age["Age3"],colors_age["Age2"])),"black")) %>%
+  group_by(Contrast) %>%
+  mutate(nhits=sum(FDR<=fdr.thresh.rna)) %>%
+  ungroup() %>%
+  mutate(Contrast_label=factor(paste0(Contrast,"\n(n=",nhits," hits)"))) %>%
+  mutate(Contrast_label=factor(Contrast_label,levels = levels(.$Contrast_label)[c(1,3,2,4,6,5)]))
+
+```
+
+
+```{r data.prep}
+
+da_logfc.fname="./data-repo/fig4_fcfc_data.RData"
+
+## Selection of chromHMM states
+cs.included <- list(fine=c("CD8_naive"="Naive CD8 T cells",
+                           "CD8_memory"="Memory CD8 T cells",
+                           "CD4_naive"="Naive CD4 T cells",
+                           "CD4_memory"="Memory CD4 T cells",
+                           "CD19"="B cells",
+                           "CD56"="NK cells",
+                           "CD14"="Monocytes") %>%
+                      data.frame(Specificity.Label=.,stringsAsFactors = F) %>%
+                      rownames_to_column("Specificity") %>%
+                      mutate(Specificity.Alias=Specificity) %>%
+                      inner_join(data.frame(color=colors_ct,stringsAsFactors=F) %>% rownames_to_column("Specificity.Alias"),by="Specificity.Alias"),
+                    state=c("naive_T"="Naive T cells",
+                            "CD19"="B cells",
+                            "CD56"="NK cells",
+                            "Monocytes"="Monocytes") %>%
+                      data.frame(Specificity.Label=.,stringsAsFactors = F) %>%
+                      rownames_to_column("Specificity") %>%
+                      mutate(Specificity.Alias=Specificity) %>%
+                      inner_join(data.frame(color=colors_ct,stringsAsFactors=F) %>% rownames_to_column("Specificity.Alias"),by="Specificity.Alias"),
+                    sublineage=c("CD3"="T cells",
+                                 "CD19"="B cells",
+                                 "CD56"="NK cells",
+                                 "CD14"="Monocytes") %>%
+                      data.frame(Specificity.Label=.,stringsAsFactors = F) %>%
+                      rownames_to_column("Specificity") %>%
+                      mutate(Specificity.Alias=Specificity) %>%
+                      inner_join(data.frame(color=colors_ct,stringsAsFactors=F) %>% rownames_to_column("Specificity.Alias"),by="Specificity.Alias"))
+
+## Selection of modules (vp2008)
+mod.included <- c("T Cells"="CD3",
+                  "B cells"="Bcells",
+                  "Cytotoxic cells"="CD56",
+                  "Myeloid lineage 1"="CD14",
+                  "Myeloid lineage 2"="CD16_monocytes",
+                  "Plasma cells"="Plasma_cells",
+                  "Inflammation I"="Macrophages_alt_activated",
+                  "Inflammation II"="Macrophages_alt_activated") %>%
+  data.frame(Module.Alias=.,stringsAsFactors = F) %>%
+  rownames_to_column("Module.Name") %>%
+  mutate(Module.Label=Module.Name) %>%
+  inner_join(data.frame(color=colors_ct,stringsAsFactors=F) %>% rownames_to_column("Module.Alias"),by="Module.Alias")
+
+## Selection of by cell types (scrnaseq)
+ct.included <- c("Naive T cells"="Naive_Tcells",
+                 "B cells"="Bcells",
+                 "NK cells"="NK_cells",
+                 "Monocytes"="Monocytes",
+                 "Activated CD8 T cells"="acCD8_Tcells",
+                 "T cells"="Tcells") %>%
+  data.frame(Module.Name=.,stringsAsFactors = F) %>%
+  rownames_to_column("Module.Label") %>%
+  mutate(Module.Alias=Module.Name) %>%
+  inner_join(data.frame(color=colors_ct,stringsAsFactors=F) %>% rownames_to_column("Module.Alias"),by="Module.Alias")
+ct.main <- ct.included %>%
+  filter(Module.Name %in% c("Naive_Tcells","Bcells","NK_cells","Monocytes"))
+
+gs.included = c("vp2008","scrnaseq_pbmc_simple_specific")
+gs.modules.included = setNames(list(mod.included,ct.main),gs.included)
+gs.pooled <- data.frame(do.call(rbind,gs.modules.included),row.names = NULL,stringsAsFactors = F)
+
+genes.highlights = c("IL7R","CD14","CD79A","CD79B","CD19","CCR7","FCGR3B","LEF1","CSF1R","CD8A","IGLL5","LYZ","NCAM1","CD160","GZMB","PRF1","IL1B","KLRF1","S100A8","S100A9","S100A12","IL8","IL18","JAK1","STAT5B","PTK2B")
+focus.hmm = c("Tss","Enh")
+
+# This matches modules/scRNA seq clusters to genes to select from for labels. A condition is that a gene has to be in a single module or cluster to get a label (ie if it is in two clusters or two modules). If in both a cluster and a module, it remains in the cluster and removed from the module.
+gs.included.genes <- do.call(rbind,lapply(gs.included, function(gs) {
+  gsenv$gs <- gs
+  gsg <- with(gsenv,merge(get(paste0("geneset.genes.",gs)),get(paste0("geneset.names.",gs)),by="Module.ID")) %>% 
+    select(-Module.ID) %>% 
+    filter(Module.Name %in% gs.modules.included[[gs]]$Module.Name) %>%
+    group_by(GeneName) %>%
+    mutate(n=dplyr::n()) %>%
+    filter(n==1) %>%
+    ungroup() %>%
+    select(-n) %>%
+    mutate(gsSource=gs)
+  rm("gs",envir = gsenv)
+  return(gsg)
+  })) %>%
+  arrange(GeneName,gsSource) %>%
+  filter(!duplicated(GeneName)) %>%
+  arrange(Module.Name,GeneName) %>%
+  select(-gsSource)
+
+if (da_logfc.fname %in% dir(recursive = T,full.names = T)) {
+  load(da_logfc.fname)
+} else {
+  logfc_bysex <- do.call(rbind,lapply(lapply(atacseq$da_bysex,`[[`,"da.list"),`[[`,"glm")) %>%
+    rownames_to_column("lab") %>%
+    mutate(Contrast=sub("\\..*","",lab),
+           peakco=sub(".*\\.","",lab),
+           Sex=sub("\\_.*","",Contrast),
+           AgeComp=sub(".*\\_","",Contrast)) %>%
+    filter(AgeComp=="Age3xAge1") %>%
+    select(-lab) %>%
+    dcast(.,AgeComp+peakco~Sex,value.var = "logFC") %>%
+    rename_at(vars(Females,Males),list(~sub("$",".atac",.))) %>%
+    inner_join(atac.allpeaks.anno.pbmc,by="peakco") %>%
+    inner_join(do.call(rbind,lapply(lapply(rnaseq$da_bysex,`[[`,"da.list"),`[[`,"glm")) %>%
+                 rownames_to_column("lab") %>%
+                 mutate(Contrast=sub("\\..*","",lab),
+                        EnsemblID=sub(".*\\.","",lab),
+                        Sex=sub("\\_.*","",Contrast),
+                        AgeComp=sub(".*\\_","",Contrast)) %>%
+                 filter(AgeComp=="Age3xAge1") %>%
+                 select(-lab) %>%
+                 dcast(.,AgeComp+EnsemblID~Sex,value.var = "logFC") %>%
+                 rename_at(vars(Females,Males),list(~sub("$",".rna",.))) %>%
+                 inner_join(anno.rna.pbmc %>% select(EnsemblID,GeneName),by="EnsemblID") %>%
+                 select(-EnsemblID),
+               by=c("AgeComp","GeneName")) %>%
+    select(AgeComp,peakco,GeneName,Females.atac,Males.atac,Females.rna,Males.rna,everything()) %>%
+    filter_at(vars(grep("chromHMMsimple",colnames(.))), any_vars(. %in% focus.hmm)) %>%
+    mutate(fmprod_atac=abs(Males.atac*Females.atac),
+           fmprod_rna=abs(Males.rna*Females.rna),
+           fmsign_atac=factor(sign(Females.atac)+sign(Males.atac)),
+           fmsign_rna=factor(sign(Females.rna)+sign(Males.rna)),
+           arc_dist=(znorm(Females.atac)-znorm(Females.rna))^2+(znorm(Males.atac)-znorm(Males.rna))^2) %>%
+    left_join(gs.included.genes,by="GeneName") %>%
+    mutate(Module.State=ifelse(grepl("^T|Naive_T",Module.Name),"CD3",
+                               ifelse(grepl("Cytotox|NK",Module.Name),"CD56",
+                                      ifelse(grepl("Myeloid|Inflammation|Mono",Module.Name),"CD14",
+                                             ifelse(grepl("^B|Plasma",Module.Name),"CD19",NA))))) %>%
+    mutate(Specificity.State=ifelse(!is.na(RE_specificity_sublineage),RE_specificity_sublineage,
+                                    ifelse(!is.na(EnhA_specificity_sublineage),EnhA_specificity_sublineage,TssA_specificity_sublineage))) %>%
+    # mutate(Module.State=ifelse(Module.State==Specificity.State,Module.State,NA)) %>%  # lowers priority of label annotations from peaks where gene and chromHMM specificity annotation do not match, in case of multiple peaks by gene, those with matching annotations (if any) get picked; also prevents from showing labels when do not match
+    arrange(GeneName,Module.State,arc_dist) %>%
+    filter(!duplicated(GeneName)) %>%
+    mutate(r_atac=cor(Females.atac,Males.atac),
+           p_atac=cor.test(Females.atac,Males.atac)$p.value,
+           r_rna=cor(Females.rna,Males.rna),
+           p_rna=cor.test(Females.rna,Males.rna)$p.value,
+           rlab_atac=sprintf("italic(r) == %0.3f",r_atac),
+           plab_atac=ifelse(p_atac>0.001,sprintf("italic(P) == %0.3f",p_atac),sprintf("italic(P) < 0.001",p_atac)),
+           rlab_rna=sprintf("italic(r) == %0.3f",r_rna),
+           plab_rna=ifelse(p_rna>0.001,sprintf("italic(P) == %0.3f",p_rna),sprintf("italic(P) < 0.001",p_rna))) %>%
+    group_by(Module.State,fmsign_atac) %>%
+    mutate(GeneLabel=ifelse(!is.na(Module.State) & (fmprod_atac>=quantile(fmprod_atac,0.9) | fmprod_rna>=quantile(fmprod_rna,0.9)) | GeneName %in% genes.highlights,GeneName,"")) %>%
+    ungroup()
+  
+  # Criteria for inclusion of gene labels in plots:
+  # 1- ATAC peaks are either active Tss or active Enh in at least one of the cell types (chromHMM) considered
+  # 2- Gene is named  as "differential" in scRNAseq analysis of clusters and therefore associated to a cell type. Only genes in one of the main 4 sets are named (naive T, B, NK, CD14).
+  # 3- Cell type gene is associated to is the same as the cell-specificity of the enhancer/promoter (eg. the gene is named as B cell-specific in both scRNAseq and chromHMM analyses) -- NOTE: THIS IS ONLY APPLIED TO CHROMHMM STATES PEAKS
+  # 4- the absolute value of the product of the fold changes between M and F are in the top 10th percentile in either ATAC or RNA data
+  # 5- If after applying these criteria there is more than one peak associated to a gene, only the one that minimizes the Euclidean distance between ATAC and RNA seq xy plots (F vs. M) is chosen
+  # 6- In addition to genes selected following these criteria, a pre-selected list is included in all plots (genes.highlights)
+  # Note: gene labels are carried out throughout the entire Fig4, including supplementary figs, both ATAC- and RNA-based plots. Only subset-relevant names are included in subset-based plots. All names included only in overall plots.
+  # Only peaks annotated to genes and genes annotated to peaks are included in these plots, for comparability between ATAC and RNA-seq patterns.
+
+  gs.selected = c("vp2008","scrnaseq_pbmc_simple_specific")
+  genesets_selected <- lapply(setNames(as.list(gs.selected),gs.selected), function(gs) {
+    gsenv$gs <- gs
+    gs.genes <- with(gsenv,merge(get(paste0("geneset.names.",gs)),get(paste0("geneset.genes.",gs)),by="Module.ID")) %>%
+      select(-Module.ID) %>%
+      split(.,f=.$Module.Name)
+    rm("gs",envir = gsenv)
+    return(gs.genes)
+  })
+  
+  logfc_bysex_byGS <- lapply(genesets_selected, function(gs.genes) {
+    logfc_gs <- do.call(rbind,lapply(gs.genes, function(G) {
+      print(G$Module.Name[[1]])
+      logfc_bysex %>%
+        select(-Module.Name) %>%
+        left_join(G,by="GeneName") %>% 
+        mutate(Module.Name=ifelse(is.na(Module.Name),"Other",Module.Name),
+               Module.Match=G$Module.Name[1],
+               inModule=ifelse(Module.Name==Module.Match,1,0)) %>%
+        group_by(inModule) %>%
+        mutate(r_atac=cor(Females.atac,Males.atac),
+               n_atac=dplyr::n(),
+               r_rna=cor(Females.rna,Males.rna),
+               n_rna=dplyr::n()) %>%
+        ungroup() %>%
+        mutate(rlo_atac=apply(data.frame(.) %>% select(r_atac,n_atac),1,function(X) CorCI(X[1],X[2])[2]),
+               rhi_atac=apply(data.frame(.) %>% select(r_atac,n_atac),1,function(X) CorCI(X[1],X[2])[3]),
+               rlo_rna=apply(data.frame(.) %>% select(r_rna,n_rna),1,function(X) CorCI(X[1],X[2])[2]),
+               rhi_rna=apply(data.frame(.) %>% select(r_rna,n_rna),1,function(X) CorCI(X[1],X[2])[3])) %>%
+        arrange(AgeComp,r_atac) %>%
+        mutate(rlab_atac=sprintf("italic(r) == %0.3f",r_atac),
+               rcilab_atac=sprintf("(%0.3f,%0.3f)",rlo_atac,rhi_atac)) %>%
+        arrange(AgeComp,r_rna) %>%
+        mutate(rlab_rna=sprintf("italic(r) == %0.3f",r_rna),
+               rcilab_rna=sprintf("(%0.3f,%0.3f)",rlo_rna,rhi_rna))
+    }))
+    return(list(Genes=gs.genes,logfc_bysex=logfc_gs))
+  })
+  
+  # Selection of chromatin states
+  cs.logfc_bysex <- do.call(rbind,lapply(lapply(atacseq$da_bysex,`[[`,"da.list"),`[[`,"glm")) %>%
+    rownames_to_column("lab") %>%
+    mutate(Contrast=sub("\\..*","",lab),
+           peakco=sub(".*\\.","",lab),
+           Sex=sub("\\_.*","",Contrast),
+           AgeComp=sub(".*\\_","",Contrast)) %>%
+    filter(AgeComp=="Age3xAge1") %>%
+    select(-lab) %>%
+    dcast(.,AgeComp+peakco~Sex,value.var = "logFC") %>%
+    rename_at(vars(Females,Males),list(~sub("$",".atac",.))) %>%
+    inner_join(atac.allpeaks.anno.pbmc,by="peakco") %>%
+    select(AgeComp,peakco,GeneName,Females.atac,Males.atac,everything()) %>%
+    mutate(fmprod_atac=abs(Males.atac*Females.atac),
+           fmsign_atac=factor(sign(Females.atac)+sign(Males.atac))) %>%
+    mutate(RE_specificity_fine=ifelse(!is.na(RE_specificity_fine),RE_specificity_fine,
+                                      ifelse(!is.na(EnhA_specificity_fine),EnhA_specificity_fine,TssA_specificity_fine)),
+           RE_specificity_fine=ifelse(grepl("^B|B$",RE_specificity_fine),"CD19",RE_specificity_fine)) %>%
+    mutate(RE_specificity_state=ifelse(!is.na(RE_specificity_state),RE_specificity_state,
+                                       ifelse(!is.na(EnhA_specificity_state),EnhA_specificity_state,TssA_specificity_state)),
+           RE_specificity_state=ifelse(grepl("^B|B$",RE_specificity_state),"CD19",RE_specificity_state)) %>%
+    mutate(RE_specificity_sublineage=ifelse(!is.na(RE_specificity_sublineage),RE_specificity_sublineage,
+                                            ifelse(!is.na(EnhA_specificity_sublineage),EnhA_specificity_sublineage,TssA_specificity_sublineage)),
+           RE_specificity_sublineage=ifelse(grepl("^T|T$",RE_specificity_sublineage),"CD3",RE_specificity_sublineage)) %>%
+    left_join(gs.included.genes,by="GeneName") %>%
+    mutate(Module.State=ifelse(grepl("^T|Naive_T",Module.Name),"CD3",
+                               ifelse(grepl("Cytotox|NK",Module.Name),"CD56",
+                                      ifelse(grepl("Myeloid|Inflammation|Mono",Module.Name),"CD14",
+                                             ifelse(grepl("^B|Plasma",Module.Name),"CD19",NA))))) %>%
+    mutate(Specificity.State=ifelse(!is.na(RE_specificity_sublineage),RE_specificity_sublineage,
+                                    ifelse(!is.na(EnhA_specificity_sublineage),EnhA_specificity_sublineage,TssA_specificity_sublineage))) %>%
+    mutate(Module.State=ifelse(Module.State==Specificity.State,Module.State,NA)) %>%  # prevents showing label annotations from peaks where gene and chromHMM specificity annotation do not match
+    mutate(r_atac=cor(Females.atac,Males.atac),
+           p_atac=cor.test(Females.atac,Males.atac)$p.value,
+           rlab_atac=sprintf("italic(r) == %0.3f",r_atac),
+           plab_atac=ifelse(p_atac>0.001,sprintf("italic(P) == %0.3f",p_atac),sprintf("italic(P) < 0.001",p_atac))) %>%
+    mutate(GeneLabel=ifelse(!is.na(Module.State) & GeneName %in% unique(logfc_bysex$GeneLabel),GeneName,""))
+  
+  ctsets = names(cs.included)
+  logfc_bysex_byCS <- lapply(setNames(as.list(ctsets),ctsets), function(ctset) {
+    print(ctset)
+    cs.ct <- as.character(cs.included[[ctset]]$Specificity)
+    logfc_cs <- do.call(rbind,lapply(cs.ct, function(S) {
+      cs.logfc_bysex %>% 
+        rename(Specificity=paste("RE_specificity",ctset,sep = "_")) %>%
+        filter(!is.na(Specificity),Specificity %in% cs.included[[ctset]]$Specificity) %>%
+        left_join(cs.included[[ctset]],by="Specificity") %>%
+        mutate(Specificity.Match=S,
+               Specificity=ifelse(Specificity!=Specificity.Match,"Other",Specificity),
+               inSet=ifelse(Specificity==Specificity.Match,1,0)) %>%
+        group_by(inSet) %>%
+        mutate(r_atac=cor(Females.atac,Males.atac),
+               n_atac=dplyr::n()) %>%
+        ungroup() %>%
+        mutate(rlo_atac=apply(data.frame(.) %>% select(r_atac,n_atac),1,function(X) CorCI(X[1],X[2])[2]),
+               rhi_atac=apply(data.frame(.) %>% select(r_atac,n_atac),1,function(X) CorCI(X[1],X[2])[3])) %>%
+        arrange(AgeComp,r_atac) %>%
+        mutate(rlab_atac=sprintf("italic(r) == %0.3f",r_atac),
+               rcilab_atac=sprintf("(%0.3f,%0.3f)",rlo_atac,rhi_atac))
+    }))
+    return(list(States=cs.ct,logfc_bysex=logfc_cs))
+  })
+
+  save(list = ls(pattern = "*logfc_bysex*"),file = da_logfc.fname)
+}
+
+```
+
+
+```{r fig4a_fcxfc, fig.asp=1}
+
+## Global plots
+# ATAC-seq
+p  <- logfc_bysex %>%
+  group_by(fmsign_atac) %>%
+  mutate(GeneLabel=ifelse(!is.na(Module.State) & (fmprod_atac>=quantile(fmprod_atac,0.99) | fmprod_rna>=quantile(fmprod_rna,0.99)) | GeneName %in% genes.highlights,GeneLabel,"")) %>%
+  ungroup() %>%
+  mutate(rlab_atac=ifelse(!duplicated(paste0(.$AgeComp,.$r_atac)),rlab_atac,""),
+         plab_atac=ifelse(!duplicated(paste0(.$AgeComp,.$r_atac)),plab_atac,""),
+         density=get_density(.$Females.atac,.$Males.atac),
+         color.density=vec2color(znorm(density),pal = coolwarm(999),limits = quantile(znorm(density),c(0.1,0.75))),
+         module.color=apply(data.frame(.) %>% 
+                              select(Module.State),1,function(m) switch(m,
+                                                                        CD3=darker("#DEA0FD"),
+                                                                        CD19=darker("#1CBE4F"),
+                                                                        CD56=darker("#FA0087"),
+                                                                        CD14=darker("#FEAF16"),
+                                                                        "dimgray"))) %>% {
+                                                                          ggplot(.,aes(Females.atac,Males.atac)) +
+                                                                            geom_point(aes(color=color.density),alpha=0.5,size=1.5,na.rm = T) +
+                                                                            geom_smooth(method = "lm",size=0.75,color="lightcoral",fullrange=T,alpha=0.5,na.rm = T,se = F) +
+                                                                            geom_hline(size=0.5,yintercept = 0) +
+                                                                            geom_vline(size=0.5,xintercept = 0) +
+                                                                            geom_abline(slope = 1,intercept = 0,linetype=2,alpha=0.5,size=0.5,color="firebrick4") +
+                                                                            geom_text(data=. %>% filter(rlab_atac!=""),aes(x=1.5,y=-1.5,label=rlab_atac),size=5,parse = T,hjust=1,vjust=-0.5,color="black",na.rm = T) +
+                                                                            geom_text(data=. %>% filter(plab_atac!=""),aes(x=1.5,y=-1.5,label=plab_atac),size=5,parse = T,hjust=1,vjust=1,color="black",na.rm = T) +
+                                                                            geom_text_repel(aes(label=GeneLabel,color=module.color),
+                                                                                            size=2.75,
+                                                                                            fontface="italic",
+                                                                                            segment.size = 0.25,
+                                                                                            segment.alpha = 0.95,
+                                                                                            point.padding = 0.1,
+                                                                                            min.segment.length = 0,
+                                                                                            force = 2,
+                                                                                            na.rm = T) +
+                                                                            scale_color_identity() +
+                                                                            scale_y_continuous(limits = c(-1.5,1.5)) +
+                                                                            scale_x_continuous(limits = c(-1.5,1.5)) +
+                                                                            labs(x="HO-HY logFC accessibility in females",y="HO-HY logFC accessibility in males") +
+                                                                            coord_equal() +
+                                                                            theme_bw(base_size = 15) +
+                                                                            theme(strip.background = element_blank())
+                                                                        }
+ggsave(plot = p,filename = "./Fig4/fig4_fcxfc_agebysex_atac_Age3xAge1.pdf")
+ggsave(plot = p,filename = "./Fig4/fig4_fcxfc_agebysex_atac_Age3xAge1.tiff",bg="transparent")
+
+# RNA-seq
+q  <- logfc_bysex %>%
+  group_by(fmsign_rna) %>%
+  mutate(GeneLabel=ifelse(!is.na(Module.State) & (fmprod_atac>=quantile(fmprod_atac,0.99) | fmprod_rna>=quantile(fmprod_rna,0.99)) | GeneName %in% genes.highlights,GeneLabel,"")) %>%
+  ungroup() %>%
+  mutate(rlab_rna=ifelse(!duplicated(paste0(.$AgeComp,.$r_rna)),rlab_rna,""),
+         plab_rna=ifelse(!duplicated(paste0(.$AgeComp,.$r_rna)),plab_rna,""),
+         density=get_density(.$Females.rna,.$Males.rna),
+         color.density=vec2color(znorm(density),pal = coolwarm(999),limits = quantile(znorm(density),c(0.1,0.75))),
+         module.color=apply(data.frame(.) %>% 
+                              select(Module.State),1,function(m) switch(m,
+                                                                        CD3=darker("#DEA0FD"),
+                                                                        CD19=darker("#1CBE4F"),
+                                                                        CD56=darker("#FA0087"),
+                                                                        CD14=darker("#FEAF16"),
+                                                                        "dimgray"))) %>% {
+                                                                          ggplot(.,aes(Females.rna,Males.rna)) +
+                                                                            geom_point(aes(color=color.density),alpha=0.5,size=1.5,na.rm = T) +
+                                                                            geom_smooth(method = "lm",size=0.75,color="lightcoral",fullrange=T,alpha=0.5,na.rm = T,se = F) +
+                                                                            geom_hline(size=0.5,yintercept = 0) +
+                                                                            geom_vline(size=0.5,xintercept = 0) +
+                                                                            geom_abline(slope = 1,intercept = 0,linetype=2,alpha=0.5,size=0.5,color="firebrick4") +
+                                                                            geom_text(data=. %>% filter(rlab_rna!=""),aes(x=2.5,y=-2.5,label=rlab_rna),size=5,parse = T,hjust=1,vjust=-0.5,color="black",na.rm = T) +
+                                                                            geom_text(data=. %>% filter(plab_rna!=""),aes(x=2.5,y=-2.5,label=plab_rna),size=5,parse = T,hjust=1,vjust=1,color="black",na.rm = T) +
+                                                                            geom_text_repel(aes(label=GeneLabel,color=module.color),
+                                                                                            size=2.75,
+                                                                                            fontface="italic",
+                                                                                            segment.size = 0.25,
+                                                                                            segment.alpha = 0.95,
+                                                                                            point.padding = 0.1,
+                                                                                            min.segment.length = 0,
+                                                                                            force = 2,
+                                                                                            na.rm = T) +
+                                                                            scale_color_identity() +
+                                                                            scale_y_continuous(limits = c(-2.5,2.5)) +
+                                                                            scale_x_continuous(limits = c(-2.5,2.5)) +
+                                                                            labs(x="HO-HY logFC accessibility in females",y="HO-HY logFC accessibility in males") +
+                                                                            coord_equal() +
+                                                                            theme_bw(base_size = 15) +
+                                                                            theme(strip.background = element_blank())
+                                                                        }
+ggsave(plot = q,filename = "./Fig4/fig4_fcxfc_agebysex_rna_Age3xAge1.pdf")
+ggsave(plot = q,filename = "./Fig4/fig4_fcxfc_agebysex_rna_Age3xAge1.tiff",bg="transparent")
+
+
+## Plots categorized by gene sets (gene-based annotations)
+fcxfc_allages <- lapply(setNames(as.list(gs.included),gs.included), function(gs) {
+  print(gs)
+  # Supplementary (whole)
+  assign(paste0("logfc_bysex_",gs),logfc_bysex_byGS[[gs]]$logfc_bysex %>%
+           left_join(gs.modules.included[[gs]],by="Module.Name") %>%
+           filter(Module.Match %in% gs.modules.included[[gs]]$Module.Name) %>%
+           mutate(Module.Name=factor(Module.Name,levels = c(gs.modules.included[[gs]]$Module.Name,"Other")),
+                  Module.Match=factor(Module.Match, levels = gs.modules.included[[gs]]$Module.Name)))
+  hue_vectors <- lapply(with(gs.modules.included[[gs]],setNames(color,Module.Name)), function(clr) rev(col2hcl(rep(clr,51),l = 50:100)))
+  
+  # ATACseq
+  p <- get(paste0("logfc_bysex_",gs)) %>%
+    mutate(rlab_atac=ifelse(!duplicated(paste0(.$AgeComp,.$r_atac)),rlab_atac,""),
+           rcilab_atac=ifelse(!duplicated(paste0(.$AgeComp,.$rlo_atac,.$rhi_atac)),rcilab_atac,"")) %>%
+    arrange(Module.Match,GeneName,-rowMax(cbind(abs(.$Females.atac),abs(.$Males.atac)))) %>%
+    mutate(rplab_atac=ifelse(rcilab_atac!="",ifelse(!!.$inModule,sub("\\(r\\)","\\(r[GS]\\)",rlab_atac),sub("\\(r\\)","\\(r[BG]\\)",paste(rlab_atac,rcilab_atac))),"")) %>%
+    group_by(Module.Match,Module.Name) %>%
+    mutate(density=get_density(Females.atac,Males.atac),
+           density=rescale(density,to=c(0.35,1))) %>%
+    ungroup() %>%
+    mutate(color.density=apply(data.frame(.) %>% select(Module.Match,density),1,function(D) vec2color(D[2],hue_vectors[[D[1]]],limits = c(0,1))),
+           color.density=ifelse(!!.$inModule,color.density,"gray65"),
+           Module.Match=plyr::mapvalues(Module.Match, from = gs.modules.included[[gs]]$Module.Name, to = gs.modules.included[[gs]]$Module.Label)) %>%
+    slice(order(inModule,density)) %>% {
+      ggplot(.,aes(Females.atac,Males.atac,fill=color.density,color=Module.Name,size=as.character(inModule),alpha=density)) +
+        geom_point(shape=21,stroke=0,na.rm = T) +
+        geom_smooth(method = "lm",fill="gainsboro",size=0.25,alpha=0.85,fullrange=T,show.legend = F,na.rm = T,se = F) +
+        geom_hline(size=0.2,yintercept = 0,color="gray60") +
+        geom_vline(size=0.2,xintercept = 0,color="gray60") +
+        # geom_abline(slope = 1,intercept = 0,linetype=2,alpha=0.5,size=0.5,color="firebrick4") +
+        geom_text(data=. %>% filter(rplab_atac!="",!!.$inModule),
+                  aes(x=2.5,y=-2.2,label=rplab_atac),
+                  size=ifelse(gs=="scrnaseq_pbmc_simple_specific",1.75,2),alpha=1,parse = T,hjust=1,vjust=0,show.legend = F,na.rm = T) +
+        geom_text(data=. %>% filter(rplab_atac!="",!.$inModule),
+                  aes(x=2.5,y=-2.5,label=rplab_atac),
+                  size=ifelse(gs=="scrnaseq_pbmc_simple_specific",1.75,2),color="black",alpha=1,parse = T,hjust=1,vjust=0,show.legend = F,na.rm = T) +
+        geom_text_repel(data=. %>% 
+                          filter(inModule==1,GeneLabel!="") %>% 
+                          group_by(Module.Match) %>% 
+                          mutate(prank=rank(-abs(fmprod_atac)*abs(fmprod_rna))) %>% 
+                          filter(prank<=10 | GeneName %in% genes.highlights),
+                        aes(label=GeneLabel),
+                        color="black",
+                        alpha=1,
+                        size=1.5,
+                        fontface="italic",
+                        segment.size = 0.1,
+                        segment.alpha = 0.5,
+                        point.padding = 0.1,
+                        min.segment.length = 0,
+                        show.legend = F,
+                        force = 0.25,
+                        na.rm = T) +
+        coord_equal() +
+        scale_color_manual(values = c(with(gs.modules.included[[gs]],setNames(color,Module.Name)),Other="gainsboro"),guide=F) + #guide=guide_legend(title = "Modules",override.aes = list(size=4,alpha=0.75))) +
+        scale_fill_identity(guide=F) + #guide=guide_legend(title = "Modules",override.aes = list(size=4,alpha=0.75))) +
+        scale_size_manual(values = c("1"=0.85,"0"=0.35),guide=F) +
+        scale_alpha_identity(guide = F) +
+        scale_y_continuous(limits = c(-2.5,2.5)) +
+        scale_x_continuous(limits = c(-2.5,2.5)) +
+        labs(x="HO-HY logFC accessibility in females",
+             y="HO-HY logFC accessibility in males",
+             title=gs) +
+        facet_wrap(~Module.Match,dir="v",ncol=ifelse(gs=="scrnaseq_pbmc_simple_specific",1,3)) +
+        theme_bw(base_size = 9) +
+        theme(panel.grid.minor = element_blank(),
+              panel.grid.major = element_line(size=0.1),
+              axis.title = element_text(size=7),
+              strip.text = element_text(size = 7,hjust=0),
+              strip.background = element_blank())
+    }
+  ggsave(plot = p,filename = paste("./Fig4/fig4_fcxfc",gs,"agebysex_Age3xAge1_atac.pdf",sep = "_"))
+  
+  # RNAseq
+  q <- get(paste0("logfc_bysex_",gs)) %>%
+    mutate(rlab_rna=ifelse(!duplicated(paste0(.$AgeComp,.$r_rna)),rlab_rna,""),
+           rcilab_rna=ifelse(!duplicated(paste0(.$AgeComp,.$rlo_rna,.$rhi_rna)),rcilab_rna,"")) %>%
+    arrange(Module.Match,GeneName,-rowMax(cbind(abs(.$Females.rna),abs(.$Males.rna)))) %>%
+    mutate(rplab_rna=ifelse(rcilab_rna!="",ifelse(!!.$inModule,sub("\\(r\\)","\\(r[GS]\\)",rlab_rna),sub("\\(r\\)","\\(r[BG]\\)",paste(rlab_rna,rcilab_rna))),"")) %>%
+    group_by(Module.Match,Module.Name) %>%
+    mutate(density=get_density(Females.rna,Males.rna),
+           density=rescale(density,to=c(0.35,1))) %>%
+    ungroup() %>%
+    mutate(color.density=apply(data.frame(.) %>% select(Module.Match,density),1,function(D) vec2color(D[2],hue_vectors[[D[1]]],limits = c(0,1))),
+           color.density=ifelse(!!.$inModule,color.density,"gray65"),
+           Module.Match=plyr::mapvalues(Module.Match, from = gs.modules.included[[gs]]$Module.Name, to = gs.modules.included[[gs]]$Module.Label)) %>%
+    slice(order(inModule,density)) %>% {
+      ggplot(.,aes(Females.rna,Males.rna,fill=color.density,color=Module.Name,size=as.character(inModule),alpha=density)) +
+        geom_point(shape=21,stroke=0,na.rm = T) +
+        geom_smooth(method = "lm",fill="gainsboro",size=0.25,alpha=0.85,fullrange=T,show.legend = F,na.rm = T,se = F) +
+        geom_hline(size=0.2,yintercept = 0,color="gray60") +
+        geom_vline(size=0.2,xintercept = 0,color="gray60") +
+        # geom_abline(slope = 1,intercept = 0,linetype=2,alpha=0.5,size=0.5,color="firebrick4") +
+        geom_text(data=. %>% filter(rplab_rna!="",!!.$inModule),
+                  aes(x=2.5,y=-2.2,label=rplab_rna),
+                  size=ifelse(gs=="scrnaseq_pbmc_simple_specific",1.75,2),alpha=1,parse = T,hjust=1,vjust=0,show.legend = F,na.rm = T) +
+        geom_text(data=. %>% filter(rplab_rna!="",!.$inModule),
+                  aes(x=2.5,y=-2.5,label=rplab_rna),
+                  size=ifelse(gs=="scrnaseq_pbmc_simple_specific",1.75,2),color="black",alpha=1,parse = T,hjust=1,vjust=0,show.legend = F,na.rm = T) +
+        geom_text_repel(data=. %>% 
+                          filter(inModule==1,GeneLabel!="") %>% 
+                          group_by(Module.Match) %>% 
+                          mutate(prank=rank(-abs(fmprod_atac)*abs(fmprod_rna))) %>% 
+                          filter(prank<=10 | GeneName %in% genes.highlights),
+                        aes(label=GeneLabel),
+                        color="black",
+                        alpha=1,
+                        size=1.5,
+                        fontface="italic",
+                        segment.size = 0.1,
+                        segment.alpha = 0.5,
+                        point.padding = 0.1,
+                        min.segment.length = 0,
+                        show.legend = F,
+                        force = 0.25,
+                        na.rm = T) +
+        coord_equal() +
+        scale_color_manual(values = c(with(gs.modules.included[[gs]],setNames(color,Module.Name)),Other="gainsboro"),guide=F) + #guide=guide_legend(title = "Modules",override.aes = list(size=4,alpha=0.75))) +
+        scale_fill_identity(guide=F) + #guide=guide_legend(title = "Modules",override.aes = list(size=4,alpha=0.75))) +
+        scale_size_manual(values = c("1"=0.85,"0"=0.35),guide=F) +
+        scale_alpha_identity(guide = F) +
+        scale_y_continuous(limits = c(-2.5,2.5)) +
+        scale_x_continuous(limits = c(-2.5,2.5)) +
+        labs(x="HO-HY logFC expression in females",
+             y="HO-HY logFC expression in males",
+             title=gs) +
+        facet_wrap(~Module.Match,dir="v",ncol=ifelse(gs=="scrnaseq_pbmc_simple_specific",1,3)) +
+        theme_bw(base_size = 9) +
+        theme(panel.grid.minor = element_blank(),
+              panel.grid.major = element_line(size=0.1),
+              axis.title = element_text(size=7),
+              strip.text = element_text(size = 7,hjust=0),
+              strip.background = element_blank())
+    }
+  ggsave(plot = q,filename = paste("./Fig4/fig4_fcxfc",gs,"agebysex_Age3xAge1_rna.pdf",sep = "_"))
+})
+
+
+# Categorized by (cell-specific) chromHMM state
+output <- lapply(names(logfc_bysex_byCS), function(ctset) {
+  print(ctset)
+  assign(paste0("logfc_bysex_",ctset),logfc_bysex_byCS[[ctset]]$logfc_bysex %>%
+           filter(Specificity.Match %in% cs.included[[ctset]]$Specificity.Alias) %>%
+           mutate(Specificity=factor(Specificity,levels = c(cs.included[[ctset]]$Specificity,"Other")),
+                  Specificity.Match=factor(Specificity.Match,levels = cs.included[[ctset]]$Specificity.Alias)))
+  hue_vectors <- lapply(with(cs.included[[ctset]],setNames(color,Specificity)), function(clr) rev(col2hcl(rep(clr,51),l = 50:100)))
+  
+  p <- get(paste0("logfc_bysex_",ctset)) %>%
+    mutate(rlab_atac=ifelse(!duplicated(paste0(.$AgeComp,.$r_atac)),rlab_atac,""),
+           rcilab_atac=ifelse(!duplicated(paste0(.$AgeComp,.$rlo_atac,.$rhi_atac)),rcilab_atac,"")) %>%
+    arrange(Specificity.Match,GeneName,-rowMax(cbind(abs(.$Females.atac),abs(.$Males.atac)))) %>%
+    mutate(rplab_atac=ifelse(rcilab_atac!="",ifelse(!!.$inSet,sub("\\(r\\)","\\(r[GS]\\)",rlab_atac),sub("\\(r\\)","\\(r[BG]\\)",paste(rlab_atac,rcilab_atac))),"")) %>%
+    group_by(Specificity.Match,Specificity) %>%
+    mutate(density=get_density(Females.atac,Males.atac),
+           density=rescale(density,to=c(0.35,1))) %>%
+    ungroup() %>%
+    mutate(color.density=apply(data.frame(.) %>% select(Specificity.Match,density),1,function(D) vec2color(D[2],hue_vectors[[D[1]]],limits = c(0,1))),
+           color.density=ifelse(!!.$inSet,color.density,"gray65"),
+           Specificity.Match=plyr::mapvalues(Specificity.Match, from = cs.included[[ctset]]$Specificity, to = cs.included[[ctset]]$Specificity.Label)) %>%
+    slice(order(inSet,density)) %>% {
+      ggplot(.,aes(Females.atac,Males.atac,fill=color.density,color=Specificity,size=as.character(inSet),alpha=density)) +
+        geom_point(shape=21,stroke=0,na.rm = T) +
+        geom_smooth(method = "lm",fill="gainsboro",size=0.25,alpha=0.85,fullrange=T,show.legend = F,na.rm = T,se = F) +
+        geom_hline(size=0.2,yintercept = 0,color="gray60") +
+        geom_vline(size=0.2,xintercept = 0,color="gray60") +
+        # geom_abline(slope = 1,intercept = 0,linetype=2,alpha=0.5,size=0.5,color="firebrick4") +
+        geom_text(data=. %>% filter(rplab_atac!="",!!.$inSet),
+                  aes(x=2.5,y=-2.2,label=rplab_atac),
+                  size=ifelse(ctset=="state",1.75,2),alpha=1,parse = T,hjust=1,vjust=0,show.legend = F,na.rm = T) +
+        geom_text(data=. %>% filter(rplab_atac!="",!.$inSet),
+                  aes(x=2.5,y=-2.5,label=rplab_atac),
+                  size=ifelse(ctset=="state",1.75,2),color="black",alpha=1,parse = T,hjust=1,vjust=0,show.legend = F,na.rm = T) +
+        geom_text_repel(data=. %>% 
+                          filter(inSet==1,GeneLabel!="") %>% 
+                          group_by(Specificity.Match) %>% 
+                          mutate(prank=rank(-abs(fmprod_atac))) %>% 
+                          filter(!duplicated(GeneLabel),
+                                 prank<=10 | GeneName %in% genes.highlights),
+                        aes(label=GeneLabel),
+                        color="black",
+                        alpha=1,
+                        size=1.5,
+                        fontface="italic",
+                        segment.size = 0.1,
+                        segment.alpha = 0.5,
+                        point.padding = 0.1,
+                        min.segment.length = 0,
+                        show.legend = F,
+                        force = 0.25,
+                        na.rm = T) +
+        coord_equal() +
+        scale_color_manual(values = c(with(cs.included[[ctset]],setNames(color,Specificity)),Other="gainsboro"),guide=F) + #guide=guide_legend(title = "Modules",override.aes = list(size=4,alpha=0.75))) +
+        scale_fill_identity(guide=F) + #guide=guide_legend(title = "Chromatin states",override.aes = list(size=4,alpha=0.75))) +
+        scale_size_manual(values = c("1"=0.85,"0"=0.35),guide=F) +
+        scale_alpha_identity(guide = F) +
+        scale_y_continuous(limits = c(-2.5,2.5)) +
+        scale_x_continuous(limits = c(-2.5,2.5)) +
+        labs(x="HO-HY logFC accessibility in females",
+             y="HO-HY logFC accessibility in males",
+             title=ctset) +
+        facet_wrap(~Specificity.Match,dir="v",ncol=ifelse(ctset=="state",1,3)) +
+        theme_bw(base_size = 9) +
+        theme(panel.grid.minor = element_blank(),
+              panel.grid.major = element_line(size=0.1),
+              axis.title = element_text(size=7),
+              strip.text = element_text(size = 7,hjust=0),
+              strip.background = element_blank())
+    }
+  ggsave(plot = p,filename = paste("./Fig4/fig4_fcxfc_cellspecific.chromstate",ctset,"agebysex_Age3xAge1_atac.pdf",sep = "_"))
+})
+
+```
+
+
+```{r fig4b_boxplots, fig.asp=1}
+
+# Box plots of accessibility and expression of genes highlighted in plots
+
+max.genes_show = 64
+genes.highlights.full <- logfc_bysex %>%
+  filter(GeneLabel!="" | GeneName %in% genes.highlights) %>%
+  mutate(prank=rank(-abs(fmprod_atac)*abs(fmprod_rna)),
+         prank=ifelse(GeneName %in% genes.highlights,0,prank)) %>%
+  arrange(prank) %>%
+  distinct(GeneName) %>%
+  slice(1:min(max.genes_show,n())) %>%
+  .$GeneName
+
+adj.data.joint.highlights <- adj.data.atac %>% 
+  filter(GeneName %in% genes.highlights.full,peakco %in% logfc_bysex$peakco) %>%
+  melt(.,measure.vars=atacseq$sampid,id.vars=c("chr","start","end","peakco","GeneName","TssA_specificity_fine","EnhA_specificity_fine","RE_specificity_fine"),variable.name="sampid",value.name="adj.atac") %>%
+  mutate(sampid=as.character(sampid)) %>%
+  inner_join(with(atacseq,data.frame(sampid,sex,age,age.group,stringsAsFactors = F)),by="sampid") %>% 
+  mutate(sex=ifelse(sex=="F","Females","Males")) %>%
+  group_by(peakco) %>%
+  mutate(adj.atac=znorm(adj.atac)) %>%
+  ungroup() %>%
+  inner_join(adj.data.rna %>% 
+               filter(GeneName %in% genes.highlights.full) %>%
+               melt(.,measure.vars=rnaseq$sampid,id.vars=c("GeneName"),variable.name="sampid",value.name="adj.rna") %>%
+               mutate(sampid=as.character(sampid)) %>%
+               group_by(GeneName) %>%
+               mutate(adj.rna=znorm(adj.rna)) %>%
+               ungroup(),
+             by=c("sampid","GeneName")) %>%
+  select(chr,start,end,peakco,GeneName,sampid,sex,age.group,age,everything()) %>%
+  melt(.,measure.vars=c("adj.atac","adj.rna"),variable.name="DataSource",value.name="adj.score") %>%
+  mutate(DataSource=as.character(sub("$","-seq",toupper(sub("adj\\.","",DataSource)))))
+
+## Plot sets by data source
+# Box plots by age group
+pdf("./Fig4/fig4_notable.genes.boxplots_Age3xAge2xAge1.pdf")
+  # All ages
+  ggplot(adj.data.joint.highlights %>% filter(DataSource=="ATAC-seq"),aes(age.group,adj.score,fill=sex,color=sex)) +
+    geom_point(size = 0.1,position=position_jitterdodge(dodge.width = 0.75,jitter.width = 0.1)) +
+    geom_boxplot(size = 0.2,alpha=0.75,outlier.size = 0) +
+    facet_wrap(~GeneName) +
+    labs(x="Age group",
+         y="Normalized accessibility",
+         title="ATAC-seq") +
+    scale_fill_manual(values = colors_sex, guide = guide_legend(title = NULL)) +
+    scale_color_manual(values = colors_sex_darken1, guide=F) +
+    theme_bw(base_size = 8) +
+    theme(aspect.ratio = 1,
+          strip.background = element_blank(),
+          strip.text = element_text(hjust=0,face = "italic"))
+  ggplot(adj.data.joint.highlights %>% filter(DataSource=="RNA-seq"),aes(age.group,adj.score,fill=sex,color=sex)) +
+    geom_point(size = 0.1,position=position_jitterdodge(dodge.width = 0.75,jitter.width = 0.1)) +
+    geom_boxplot(size = 0.2,alpha=0.75,outlier.size = 0) +
+    facet_wrap(~GeneName) +
+    labs(x="Age group",
+         y="Normalized expression",
+         title="RNA-seq") +
+    scale_fill_manual(values = colors_sex, guide = guide_legend(title = NULL)) +
+    scale_color_manual(values = colors_sex_darken1, guide=F) +
+    theme_bw(base_size = 8) +
+    theme(aspect.ratio = 1,
+          strip.background = element_blank(),
+          strip.text = element_text(hjust=0,face = "italic"))
+  # HO vs HY
+  ggplot(adj.data.joint.highlights %>% filter(DataSource=="ATAC-seq",age.group!="HM"),aes(age.group,adj.score,fill=sex,color=sex)) +
+    geom_point(size = 0.1,position=position_jitterdodge(dodge.width = 0.75,jitter.width = 0.1)) +
+    geom_boxplot(size = 0.2,alpha=0.75,outlier.size = 0) +
+    facet_wrap(~GeneName) +
+    labs(x="Age group",
+         y="Normalized accessibility",
+         title="ATAC-seq") +
+    scale_fill_manual(values = colors_sex, guide = guide_legend(title = NULL)) +
+    scale_color_manual(values = colors_sex_darken1, guide=F) +
+    theme_bw(base_size = 8) +
+    theme(aspect.ratio = 1,
+          strip.background = element_blank(),
+          strip.text = element_text(hjust=0,face = "italic"))
+  ggplot(adj.data.joint.highlights %>% filter(DataSource=="RNA-seq",age.group!="HM"),aes(age.group,adj.score,fill=sex,color=sex)) +
+    geom_point(size = 0.1,position=position_jitterdodge(dodge.width = 0.75,jitter.width = 0.1)) +
+    geom_boxplot(size = 0.2,alpha=0.75,outlier.size = 0) +
+    facet_wrap(~GeneName) +
+    labs(x="Age group",
+         y="Normalized expression",
+         title="RNA-seq") +
+    scale_fill_manual(values = colors_sex, guide = guide_legend(title = NULL)) +
+    scale_color_manual(values = colors_sex_darken1, guide=F) +
+    theme_bw(base_size = 8) +
+    theme(aspect.ratio = 1,
+          strip.background = element_blank(),
+          strip.text = element_text(hjust=0,face = "italic"))
+dev.off()
+  
+
+# Scatterplots by chronological age
+pdf("./Fig4/fig4_notable.genes.chronoplots.pdf")
+  ggplot(adj.data.joint.highlights %>% filter(DataSource=="ATAC-seq"),aes(age,adj.score,fill=sex,color=sex)) +
+    geom_point(size = 1,shape=21,alpha=0.5,stroke=0.5) +
+    geom_smooth(size=0.75,alpha=0.5,method = "lm",se = F,show.legend = F) +
+    facet_wrap(~GeneName) +
+    labs(x="Age, yo",
+         y="Normalized accessibility",
+         title="ATAC-seq") +
+    scale_fill_manual(values = colors_sex_lighten1, guide = guide_legend(title = NULL,override.aes = list(size=2))) +
+    scale_color_manual(values = sapply(colors_sex,darker,2), guide=F) +
+    theme_bw(base_size = 8) +
+    theme(aspect.ratio = 1,
+          strip.background = element_blank(),
+          strip.text = element_text(hjust=0,face = "italic"))
+  ggplot(adj.data.joint.highlights %>% filter(DataSource=="RNA-seq"),aes(age,adj.score,fill=sex,color=sex)) +
+    geom_point(size = 1,shape=21,alpha=0.5,stroke=0.5) +
+    geom_smooth(size=0.75,alpha=0.5,method = "lm",se = F,show.legend = F) +
+    facet_wrap(~GeneName) +
+    labs(x="Age, yo",
+         y="Normalized expression",
+         title="RNA-seq") +
+    scale_fill_manual(values = colors_sex_lighten1, guide = guide_legend(title = NULL,override.aes = list(size=2))) +
+    scale_color_manual(values = sapply(colors_sex,darker,2), guide=F) +
+    theme_bw(base_size = 8) +
+    theme(aspect.ratio = 1,
+          strip.background = element_blank(),
+          strip.text = element_text(hjust=0,face = "italic"))
+dev.off()
+
+
+```
+
+
