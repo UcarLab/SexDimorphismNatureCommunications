@@ -1,0 +1,601 @@
+---
+title: "Fig2"
+author: "Eladio J Marquez"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list = ls())
+
+library(pals)
+library(scales)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+library(cowplot)
+library(grid)
+library(gridExtra)
+library(gtable)
+library(tibble)
+library(Vennerable)
+library(reshape2)
+library(dplyr)
+
+# Loads ATAC data
+peak.set = "narrow"
+run.name="AgexSex_homo" # Age|AgexSex|AgexSex_homo
+batch.variable="batchdate" # batchdate|rebatch
+
+atac_data <- load(paste0("./data-repo/pbmc_aging.summer2017_",peak.set,"Peaks_filtered.RData"))
+atac_stats <- load(paste0("./data-repo/aging.summer2017_filtered_global.stats_",peak.set,"Peaks_filtered.RData"))
+da_output <- load(paste0("./data-repo/da_output_",run.name,"_",batch.variable,"_",peak.set,"Peaks","_BySex.RData"))
+adj.data.atac <- lapply(lapply(da_bysex,`[[`,"da.list"),`[[`,"adj")[[1]] %>%
+  data.frame(.) %>%
+  rownames_to_column("peakco") %>%
+  inner_join(atac.allpeaks.anno.pbmc,.,by="peakco")
+
+# Expression data
+rna_data <- load("./data-repo/pbmc_aging.summer2017_RNA_filtered.RData")
+
+# Global parameters
+fdr.thresh = 0.05
+pflank = 2000
+min.expressed = 3
+geneset.path = "./data-repo/geneset.info.RData"
+min.modgenes = 5
+gene.uni <- sort(unique((expressed.pbmc %>% mutate(EnsemblID=rownames(.)) %>% filter(Total.counts>=min.expressed) %>% inner_join(anno.rna.pbmc,by="EnsemblID"))$GeneName))
+fdr.thresh.enrichtest = 0.05
+focus.celltypes <- c("PBMC","CD14","CD56","CD19","CD4_naive","CD4_memory","CD8_naive","CD8_memory")
+
+# Load annotation gene sets
+gsenv = new.env() 
+genesets <- load(geneset.path,envir = gsenv)
+
+# External+helper scripts
+source("./scripts/modules.enrichtest.R")
+source("./scripts/module_test_functions.R")
+source("./scripts/grafx_functions.R")
+source("./scripts/da_bypeakset.R")
+source("./scripts/ms_colors.R")
+
+# Chromatin accessibility differential anaysis results
+da.glm_agebysex <- do.call(rbind,lapply(names(da_bysex), function(n) {
+  da_bysex[[n]]$da.list$glm %>%
+    rownames_to_column("peakco") %>%
+    mutate(Contrast=n)
+})) %>%
+  filter(!grepl("Age2",Contrast)) %>%
+  mutate(Contrast_color=ifelse(FDR<=fdr.thresh,ifelse(logFC<0,ifelse(grepl("Age1",.$Contrast),colors_age["Age1"],colors_age["Age2"]),ifelse(grepl("Age3",.$Contrast),colors_age["Age3"],colors_age["Age2"])),"black")) %>%
+    group_by(Contrast) %>%
+    mutate(nhits=sum(FDR<=fdr.thresh)) %>%
+    ungroup() %>%
+    mutate(Contrast_label=factor(paste0(Contrast,"\n(n=",nhits," hits)"))) %>%
+    mutate(Contrast_label=factor(Contrast_label,levels = levels(.$Contrast_label)[c(1,3,2,4,6,5)]))
+
+```
+
+# Figure 2A. MA plot, age by sex, HO vs HY
+
+```{r fig2a_maplot, fig.asp=1}
+
+p <- ggplot(da.glm_agebysex %>% 
+              mutate(Contrast_label=factor(sub("_",", ",sub("x"," vs ",sub("Age1","HY",sub("Age2","HM",sub("Age3","HO",Contrast_label))))))) %>%
+              arrange(-PValue),
+            aes(logCPM,logFC,color=Contrast_color)) +
+  geom_point(size=0.15,alpha=0.75) +
+  geom_hline(yintercept = 0,size=0.25) +
+  geom_vline(xintercept = 0,size=0.25) +
+  facet_wrap(~Contrast_label,dir = "h") +
+  scale_color_identity() +
+  labs(x="Average peak size, logCPM",
+       y="logFC",
+       title="Differential accessibility, HO-HY",
+       subtitle=paste0(100*fdr.thresh,"% FDR")) +
+  theme_bw(base_size = 10) +
+  theme(aspect.ratio = 1,strip.background = element_blank())
+ggsave(plot = p,filename = "./Fig2/fig2_maplot_agebysex.pdf")
+ggsave(plot = p,filename = "./Fig2/fig2_maplot_agebysex.tiff",bg="transparent")
+
+shared_da.glm_agebysex <- da.glm_agebysex %>% 
+  filter(FDR<=fdr.thresh) %>%
+  filter(peakco %in% intersect(subset(data.frame(.),grepl("Females",Contrast) & FDR<=fdr.thresh)$peakco,
+                               subset(data.frame(.),grepl("Males",Contrast) & FDR<=fdr.thresh)$peakco)) %>%
+  mutate(shared.status="Both DA") %>%
+  rbind(da.glm_agebysex %>% 
+          filter(FDR<=fdr.thresh) %>%
+          filter(!peakco %in% intersect(subset(data.frame(.),grepl("Females",Contrast) & FDR<=fdr.thresh)$peakco,
+                                        subset(data.frame(.),grepl("Males",Contrast) & FDR<=fdr.thresh)$peakco)) %>%
+          mutate(shared.status=ifelse(grepl("Females",Contrast),"Females DA","Males DA"))) %>% 
+  mutate(direction=ifelse(logFC<0,"HY","HO")) %>%
+  group_by(shared.status,Contrast) %>%
+  mutate(nhits=n(),
+         Status_label=ifelse(shared.status=="Both DA","Both DA","Sex-specific DA")) %>%
+  ungroup() %>%
+  mutate(Contrast_label=paste0(sub("\\_Age3xAge1.*","",Contrast_label),"\n(",nhits,")"))
+
+q <- ggplot(shared_da.glm_agebysex,aes(Contrast_label,logFC,fill=direction,color=direction)) +
+  geom_point(size=0.25,alpha=0.15,position=position_jitter(width = 0.05),color="dimgray") +
+  geom_hline(yintercept = 0,size=0.25,alpha = 0.5) +
+  geom_violin(position="identity",draw_quantiles = 0.5,scale = "area",trim = T,alpha=0.5,size=0.25) +
+  scale_fill_manual(values = colors_age,guide=F) +
+  scale_color_manual(values = colors_age,guide=F) +
+  facet_wrap(~Status_label,nrow = 1,drop = T,scales = "free_x") +
+  labs(x="Sex specificity of DA peaks",
+       y="logFC, HO-HY",
+       title="Common vs. sex-specific differences\nin chromatin accessibility") +
+  theme_bw(base_size = 12) +
+  theme(aspect.ratio = 3,
+        strip.background = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+ggsave(plot = q,filename = "./Fig2/fig2_da.sexspec_agebysex.pdf")
+ggsave(plot = q,filename = "./Fig2/fig2_da.sexspec_agebysex.tiff",bg="transparent")
+
+```
+
+# Figure 2B. Distribution of chromHMM states among differentially accessible peaks
+
+```{r fig2b_da_chromhmm.dist, fig.asp=1}
+
+# Distribution of PBMC chromHMM states
+da.chromhmm.dist_agebysex <- shared_da.glm_agebysex %>% 
+  mutate(AgeContrast=sub(".*\\_","",Contrast),
+         SexContrast=sub("\\_.*","",Contrast),
+         direction=ifelse(logFC<0,"Closing peaks in","Opening peaks in")) %>%
+  inner_join(atac.allpeaks.anno.pbmc,by="peakco") %>% 
+  select(grep("peakco|direction|SexContrast|chromHMMsimple|shared.status",colnames(.))) %>%
+  melt(.,id.vars=c("SexContrast","direction","peakco","shared.status"),variable.name="source_celltype",value.name="chromHMMsimple") %>%
+  filter(grepl(paste(focus.celltypes,collapse = "|"),source_celltype)) %>%
+  droplevels() %>%
+  mutate(source_celltype=sub("\\_","\n",sub("chromHMMsimple\\_","",source_celltype)),
+         source_celltype=factor(source_celltype,levels = sub("\\_","\n",focus.celltypes))) %>%
+  group_by(shared.status,SexContrast,direction,source_celltype) %>%
+  mutate(n=n()) %>%
+  ungroup() %>%
+  mutate(label=paste0(shared.status,"\n",direction,"\n",tolower(SexContrast),"\n",n)) %>%
+  group_by(SexContrast,direction,source_celltype) %>%
+  mutate(nhits=n()) %>%
+  ungroup() %>%
+  mutate(label_brief=paste0(direction,"\n",tolower(SexContrast),"\n",nhits))
+
+p <- ggplot(da.chromhmm.dist_agebysex,
+            aes(factor(1),fill=chromHMMsimple)) +
+  geom_bar(position="fill",width=2,size=0.2,color="white") +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = colors_hmm6,guide=guide_legend(title = NULL,
+                                                            label.theme = element_text(size=6,angle=0),
+                                                            override.aes = list(size=2))) +
+  scale_y_continuous(expand = c(0,0)) +
+  facet_grid(source_celltype~label,switch = "y") +
+  labs(x=NULL,
+       y=NULL,
+       title=paste0("Chromatin state annotation distribution of DA peaks (",100*fdr.thresh,"% FDR)")) +
+  theme_minimal(base_size = 10) +
+  theme(aspect.ratio = 1,
+        plot.title = element_text(hjust=0.5),
+        strip.background = element_blank(),
+        strip.text.y = element_text(size=10,angle=180,hjust=0),
+        strip.text.x = element_text(size=5,angle=0,hjust=0.5),
+        axis.text = element_blank(),
+        panel.grid = element_blank(),
+        panel.spacing.y = unit(0.5,"lines"))
+ggsave(plot = p,filename = "./Fig2/sexspecific/fig2_chromhmm.dist_agebysex_sexspecific.pdf")
+
+q <- ggplot(da.chromhmm.dist_agebysex,
+            aes(factor(1),fill=chromHMMsimple)) +
+  geom_bar(position="fill",width=2,size=0.2,color="white") +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = colors_hmm6,guide=guide_legend(title = NULL,
+                                                            label.theme = element_text(size=6,angle=0),
+                                                            override.aes = list(size=2))) +
+  scale_y_continuous(expand = c(0,0)) +
+  facet_grid(source_celltype~label_brief,switch = "y") +
+  labs(x=NULL,
+       y=NULL,
+       title=paste0("Chromatin state annotation distribution of DA peaks (",100*fdr.thresh,"% FDR)")) +
+  theme_minimal(base_size = 10) +
+  theme(aspect.ratio = 1,
+        plot.title = element_text(hjust=0.5),
+        strip.background = element_blank(),
+        strip.text.y = element_text(size=10,angle=180,hjust=0),
+        strip.text.x = element_text(size=6,angle=0,hjust=0.5),
+        axis.text = element_blank(),
+        panel.grid = element_blank(),
+        panel.spacing.y = unit(0.5,"lines"))
+ggsave(plot = q,filename = "./Fig2/fig2_chromhmm.dist_agebysex.pdf")
+
+```
+
+
+
+```{r fig2c_da_cellspec.dist, fig.asp=1}
+
+ctset = "fine"
+da.chromhmm.spec_agebysex <- shared_da.glm_agebysex %>% 
+  mutate(SexContrast=sub("\\_.*","",Contrast),
+         direction=ifelse(logFC<0,"Closing peaks in","Opening peaks in")) %>%
+  left_join(atac.allpeaks.anno.pbmc %>% 
+              select(grep(paste0("peakco|specificity_",ctset),colnames(.))),
+            by="peakco") %>%
+  filter(FDR<=fdr.thresh) %>%
+  group_by(SexContrast,direction) %>%
+  mutate(n_diff=n()) %>%
+  ungroup()
+
+# Distribution plots
+p <- ggplot(da.chromhmm.spec_agebysex %>% 
+              select(shared.status,SexContrast,direction,paste0("RE_specificity_",ctset)) %>%
+              rename_all(funs(sub("RE_specificity.*","Specificity",.))) %>%
+              mutate(Specificity=factor(ifelse(is.na(Specificity),"Cell-agnostic state","Cell-specific state"))) %>%
+              group_by(shared.status,SexContrast,direction,Specificity) %>%
+              summarize(N=n()) %>%
+              group_by(shared.status,SexContrast,direction) %>%
+              mutate(n=sum(N),p=N/n) %>%
+              mutate(label=paste0(direction,"\n",tolower(SexContrast),"\nn=",n)) %>%
+              arrange(shared.status,SexContrast,direction,Specificity,n,p) %>%
+              mutate(cump=1-cumsum(p),diffp=cump-0.5*c((max(cump)-1),diff(cump)),posit=seq(1,1.25,length.out = n())) %>%
+              ungroup(),
+            aes(factor(1),p,fill=Specificity,color=Specificity)) +
+  geom_bar(stat="identity",position="fill",width=2,size=0.1,alpha=0.85,color="ghostwhite") +
+  geom_label(aes(posit,diffp,label=N,fill=Specificity),size=3,label.padding = unit(0.2,"lines"),na.rm = T) +
+  scale_fill_manual(values = c("slategray2","tomato"),guide=guide_legend(title = NULL,override.aes = list(color=NA))) +
+  scale_color_manual(values = c("dimgray","lightyellow"),guide=F) +
+  coord_polar(theta = "y") +
+  facet_wrap(shared.status~label,ncol=4,dir = "h") +
+  labs(x=NULL,y=NULL,
+       title="Distribution of cell-specific and agnostic RE among DA peaks (5% FDR)") +
+  theme_minimal(base_size = 10) +
+  theme(strip.background = element_blank(),
+        strip.text.y = element_text(angle=180,hjust=0),
+        axis.text = element_blank(),
+        panel.grid = element_blank())
+ggsave(p,filename = "./Fig2/sexspecific/fig2_specificity.dist_agebysex_sexspecific.pdf")
+
+q <- ggplot(da.chromhmm.spec_agebysex %>% 
+              select(SexContrast,direction,paste0("RE_specificity_",ctset)) %>%
+              rename_all(funs(sub("RE_specificity.*","Specificity",.))) %>%
+              mutate(Specificity=factor(ifelse(is.na(Specificity),"Cell-agnostic state","Cell-specific state"))) %>%
+              group_by(SexContrast,direction,Specificity) %>%
+              summarize(N=n()) %>%
+              group_by(SexContrast,direction) %>%
+              mutate(n=sum(N),p=N/n) %>%
+              mutate(label=paste0(direction,"\n",tolower(SexContrast),"\nn=",n)) %>%
+              arrange(SexContrast,direction,Specificity,n,p) %>%
+              mutate(cump=1-cumsum(p),diffp=cump-0.5*c((max(cump)-1),diff(cump)),posit=seq(1,1.25,length.out = n())) %>%
+              ungroup(),
+            aes(factor(1),p,fill=Specificity,color=Specificity)) +
+  geom_bar(stat="identity",position="fill",width=2,size=0.1,alpha=0.85,color="ghostwhite") +
+  geom_label(aes(posit,diffp,label=N,fill=Specificity),size=3,label.padding = unit(0.2,"lines"),na.rm = T) +
+  scale_fill_manual(values = c("slategray2","tomato"),guide=guide_legend(title = NULL,override.aes = list(color=NA))) +
+  scale_color_manual(values = c("dimgray","lightyellow"),guide=F) +
+  coord_polar(theta = "y") +
+  facet_wrap(~label,nrow=2,dir = "v") +
+  labs(x=NULL,y=NULL,
+       title="Distribution of cell-specific and agnostic RE among DA peaks (5% FDR)") +
+  theme_minimal(base_size = 12) +
+  theme(strip.background = element_blank(),
+        strip.text.y = element_text(angle=180,hjust=0),
+        axis.text = element_blank(),
+        panel.grid = element_blank())
+ggsave(q,filename = "./Fig2/fig2_specificity.dist_agebysex.pdf")
+
+r <- ggplot(da.chromhmm.spec_agebysex %>% 
+              select(SexContrast,direction,paste0("RE_specificity_",ctset)) %>%
+              rename_all(funs(sub("RE_specificity.*","Specificity",.))) %>%
+              filter(!is.na(Specificity)) %>%
+              mutate(Specificity=ifelse(grepl("^B|Plasma",Specificity),"CD19",Specificity),
+                     Specificity=factor(ifelse(Specificity %in% c(focus.celltypes),Specificity,"Other"))) %>%
+              group_by(SexContrast,direction,Specificity) %>%
+              summarize(N=n()) %>%
+              group_by(SexContrast,direction) %>%
+              mutate(n=sum(N),p=N/n) %>%
+              mutate(label=paste0(direction,"\n",tolower(SexContrast),"\nn=",n)) %>%
+              arrange(SexContrast,direction,Specificity,n,p) %>%
+              mutate(cump=1-cumsum(p),diffp=cump-0.5*c((max(cump)-1),diff(cump)),posit=seq(1,1.25,length.out = n())) %>%
+              ungroup(),
+            aes(factor(1),p,fill=Specificity)) +
+  geom_bar(stat="identity",position="fill",width=1,size=0,alpha=0.85,color="ghostwhite") +
+  geom_label_repel(aes(2.25,diffp,label=N,fill=Specificity),color="lightyellow",size=2.5,label.padding = unit(0.2,"lines"),hjust=0,force = 0.1,direction = "y",min.segment.length = 10,na.rm = T) +
+  scale_fill_manual(values = c(Other="lightseagreen",colors_ct),guide=guide_legend(title = NULL,override.aes = list(color=NA))) +
+  # coord_polar(theta = "y") +
+  facet_wrap(~label,nrow=2,dir = "v") +
+  labs(x=NULL,y=NULL,
+       title="Distribution of cell-specific RE among DA peaks (5% FDR)") +
+  theme_minimal(base_size = 8) +
+  theme(aspect.ratio = 4,
+        strip.background = element_blank(),
+        strip.text.y = element_text(angle=180,hjust=0),
+        axis.text = element_blank(),
+        panel.grid = element_blank())
+ggsave(r,filename = "./Fig2/fig2_specificity.dist_agebysex_cellspecific.pdf")
+
+s <- ggplot(da.chromhmm.spec_agebysex %>% 
+              select(peakco,SexContrast,direction,paste0("RE_specificity_",ctset)) %>%
+              rename_all(funs(sub("RE_specificity.*","Specificity",.))) %>%
+              filter(!is.na(Specificity)) %>%
+              mutate(Specificity=ifelse(grepl("^B|Plasma",Specificity),"CD19",Specificity),
+                     Specificity=factor(ifelse(Specificity %in% c(focus.celltypes),Specificity,"Other")),
+                     direction=sub(" in$","",direction)) %>%
+              group_by(SexContrast,direction,Specificity) %>%
+              summarize(n=n()) %>%
+              group_by(SexContrast,Specificity) %>%
+              mutate(N=sum(n),
+                     logN=log2(N)) %>%
+              ungroup() %>%
+              arrange(SexContrast,Specificity,direction) %>%
+              mutate(Specificity=factor(Specificity,levels = c(focus.celltypes,"Other")),
+                     label=factor(paste0("DA in ",SexContrast,"\n",Specificity,"\nn = ",N))) %>%
+              mutate(label=factor(label,levels = levels(label)[c(1,5,2,4,3,7,6,8,8+c(1,5,2,4,3,7,6,8))])),
+            aes(x=logN/2,y=n,fill=direction,width=logN)) +
+  geom_bar(size=0.25,color="white",position="fill",stat="identity") +
+  scale_fill_manual(values = colors_age,guide=guide_legend(title = NULL)) +
+  coord_polar(theta = "y") +
+  facet_wrap(~label,nrow=2,dir = "h") +
+  labs(x=NULL,y=NULL,
+       title="Distribution of aging-related changes in DA peaks (5% FDR) at cell-specific regulatory elements",
+       caption="Chart scale proportional to base 2 log n") +
+  theme_minimal(base_size = 8) +
+  theme(strip.background = element_blank(),
+        strip.text.y = element_text(angle=180,hjust=0),
+        panel.spacing.y = unit(0.1,"lines"),
+        axis.text = element_blank(),
+        plot.caption = element_text(size = 7,face = "italic",hjust=0),
+        panel.grid = element_blank(),
+        legend.position = "bottom",
+        legend.key.size = unit(0.5,"lines"))
+ggsave(s,filename = "./Fig2/fig2_chromhmm_states.specificity_agebysex.pdf")
+
+u <- ggplot(da.chromhmm.spec_agebysex %>% 
+              select(peakco,shared.status,SexContrast,direction,paste0("RE_specificity_",ctset)) %>%
+              rename_all(funs(sub("RE_specificity.*","Specificity",.))) %>%
+              filter(!is.na(Specificity)) %>%
+              mutate(Specificity=ifelse(grepl("^B|Plasma",Specificity),"CD19",Specificity),
+                     Specificity=factor(ifelse(Specificity %in% c(focus.celltypes),Specificity,"Other")),
+                     direction=sub(" in$","",direction)) %>%
+              group_by(shared.status,SexContrast,direction,Specificity) %>%
+              summarize(n=n()) %>%
+              group_by(shared.status,SexContrast,Specificity) %>%
+              mutate(N=sum(n),
+                     logN=log2(N)) %>%
+              ungroup() %>%
+              arrange(shared.status,SexContrast,Specificity,direction) %>%
+              filter(!(shared.status=="Both DA" & SexContrast=="Males")) %>%
+              mutate(Specificity=factor(Specificity,levels = c(focus.celltypes,"Other")),
+                     shared.status=sub(".*Both.*","DA in both sexes",sub("^","DA in ",sub(" DA$"," only",shared.status))),
+                     label=factor(paste0(shared.status,"\n",Specificity,"\nn = ",N))) %>%
+              mutate(label=factor(label,levels = levels(label)[c(1,5,2,4,3,7,6,8,8+c(1,5,2,4,3,7,6,8),16+c(1,5,2,4,3,7,6,8))])),
+            aes(x=logN/2,y=n,fill=direction,width=logN)) +
+  geom_bar(size=0.25,color="white",position="fill",stat="identity") +
+  scale_fill_manual(values = colors_age,guide=guide_legend(title = NULL)) +
+  coord_polar(theta = "y") +
+  facet_wrap(~label,nrow=3,dir = "h") +
+  labs(x=NULL,y=NULL,
+       title="Distribution of aging-related changes in DA peaks (5% FDR) at cell-specific regulatory elements",
+       caption="Chart scale proportional to base 2 log n") +
+  theme_minimal(base_size = 8) +
+  theme(strip.background = element_blank(),
+        strip.text.y = element_text(angle=180,hjust=0),
+        panel.spacing.y = unit(0.1,"lines"),
+        axis.text = element_blank(),
+        plot.caption = element_text(size = 7,face = "italic",hjust=0),
+        panel.grid = element_blank(),
+        legend.position = "bottom",
+        legend.key.size = unit(0.5,"lines"))
+ggsave(u,filename = "./Fig2/sexspecific/fig2_chromhmm_states.specificity_agebysex_sexspecific.pdf")
+
+```
+
+```{r fig2d_da_cellspec.enrichtest, fig.asp=1}
+
+glm_bysex <- lapply(lapply(da_bysex,`[[`,"da.list"),`[[`,"glm")[c("Females_Age3xAge1","Males_Age3xAge1")]
+
+da.chromhmm_enrichment_agebysex <- do.call(rbind,lapply(names(glm_bysex), function(n) {
+  X <- glm_bysex[[n]]
+  cs_test <- module_test_peaks(peak.anno=atac.allpeaks.anno.pbmc %>%
+                                 inner_join(X %>% rownames_to_column("peakco"),
+                                            by="peakco") %>%
+                                 select(chr,start,end,logFC,FDR,DistancetoTSS),
+                               background=atac.allpeaks.anno.pbmc %>% inner_join(da.glm_agebysex %>% distinct(peakco),by="peakco") %>% select(chr,start,end),
+                               test.fdr=fdr.thresh,
+                               test.logfc=Inf,
+                               logfc.name="logFC",
+                               fdr.name="FDR",
+                               direction.string=list(pos="Opening with aging",neg="Closing with aging"),
+                               comp.name=NULL,
+                               peakset=atac.allpeaks.anno.pbmc %>% 
+                                 inner_join(da.chromhmm.spec_agebysex %>% 
+                                              dplyr::rename(Specificity=paste("RE_specificity",ctset,sep="_")),
+                                            by="peakco") %>% 
+                                 select(chr,start,end,Specificity) %>% 
+                                 mutate(Specificity=ifelse(grepl("^B|Plasma",Specificity),"CD19",Specificity)) %>%
+                                 filter(!is.na(Specificity)) %>% 
+                                 split(.,f=.$Specificity),
+                               min.peakcount=3,
+                               enrich.fdr=fdr.thresh.enrichtest,
+                               flank.size = 1e5,
+                               verbose=FALSE)
+  cs_out <- cs_test$all %>%
+    mutate(Contrast=n,
+           SexContrast=factor(sub("\\_.*","",Contrast)),
+           AgeContrast=sub("Age3","HO",sub("Age2","HM",sub("Age1","HY",sub(".*\\_","",Contrast)))),
+           celltype_set=ctset)
+  return(cs_out)
+})) %>%
+  mutate(hypergeom.p=ifelse(is.infinite(hypergeom.p),max((data.frame(.) %>% filter(!is.infinite(hypergeom.p)))$hypergeom.p),hypergeom.p),
+         signed.hypergeom.p=ifelse(grepl("Closing",direction),-hypergeom.p,hypergeom.p),
+         hypergeom.fdr=p.adjust(10^(-hypergeom.p),method = "fdr"))
+threshP_cs <- min((da.chromhmm_enrichment_agebysex %>% filter(hypergeom.fdr<=fdr.thresh.enrichtest))$hypergeom.p)
+
+ntest <- c("F"=nrow(glm_bysex$Females_Age3xAge1 %>% filter(FDR<=fdr.thresh)),
+           "M"=nrow(glm_bysex$Males_Age3xAge1 %>% filter(FDR<=fdr.thresh)))
+nbg <- nrow(da.glm_agebysex %>% distinct(peakco))
+p <- ggplot(da.chromhmm_enrichment_agebysex %>%
+              mutate(celltype=factor(celltype,levels = c("CD14","Megakaryocytes","Erythroblasts",focus.celltypes[-2])),
+                     direction=paste(sub("with aging","in",direction),tolower(SexContrast)),
+                     hypergeom.p=ifelse(hypergeom.p > -log10(1e-50),-log10(1e-75),hypergeom.p),
+                     signed.hypergeom.p=sign(signed.hypergeom.p)*hypergeom.p),
+            aes(celltype,direction,fill=signed.hypergeom.p,size=hypergeom.p,alpha=hypergeom.p>=threshP_cs,label=ifelse(hypergeom.p>=threshP_cs,peak.count,""))) +
+  geom_point(shape=21,stroke=0.25) +
+  geom_text(size=2,alpha=1) +
+  scale_alpha_manual(values = c("FALSE"=0.15,"TRUE"=0.85),guide=F) +
+  scale_fill_gradient2(low = "dodgerblue2",mid = "snow1",high = "firebrick2",guide=guide_colorbar(title = "loginvP (signed)")) +
+  scale_size_continuous(range = c(1.5,8),guide=guide_legend(title = "loginvP",override.aes = list(stroke=0.25))) +
+  scale_x_discrete(expand = c(0,0.75)) +
+  scale_y_discrete(expand = c(0,0.75)) +
+  # facet_wrap(~chrom_state,ncol=1) +
+  labs(x="Cell specificity",
+       y="Enrichment, -log10 P",
+       title=paste0("Significantly enriched cell-specific regulatory elements\namong DO peaks (",0.1*100,"% FDR)"),
+       caption=paste0("Based on N=",paste(ntest,collapse = " and ")," test peaks in males and females, and N=",nbg," background peaks.")) +
+  theme_bw(base_size = 10) +
+  theme(aspect.ratio = 0.5,
+        strip.background = element_blank(),
+        strip.text.y = element_text(angle=0,hjust=0),
+        strip.text.x = element_text(size=10,hjust=0),
+        axis.text.x = element_text(angle=45,hjust=1),
+        panel.grid.major.y = element_blank(),
+        legend.box = "horizontal",
+        plot.caption = element_text(hjust=0,face = "italic",size = 6))
+ggsave(p,filename = "./Fig2/fig2_chromhmm_states.specificity_agebysex_enrichtest_complete.pdf")
+
+
+q <- ggplot(da.chromhmm_enrichment_agebysex %>%
+              filter(celltype %in% focus.celltypes) %>%
+              mutate(celltype=factor(celltype,levels = focus.celltypes),
+                     direction=paste(sub("with aging","in",direction),tolower(SexContrast)),
+                     hypergeom.p=ifelse(hypergeom.p > -log10(1e-50),-log10(1e-75),hypergeom.p),
+                     signed.hypergeom.p=sign(signed.hypergeom.p)*hypergeom.p),
+            aes(celltype,direction,fill=signed.hypergeom.p,size=hypergeom.p,alpha=hypergeom.p>=threshP_cs,label=ifelse(hypergeom.p>=threshP_cs,peak.count,""))) +
+  geom_point(shape=21,stroke=0.35) +
+  geom_text(size=2,alpha=1) +
+  scale_alpha_manual(values = c("FALSE"=0.15,"TRUE"=0.85),guide=F) +
+  scale_fill_gradient2(low = "dodgerblue2",mid = "snow1",high = "firebrick2",guide=guide_colorbar(title = "loginvP (signed)")) +
+  scale_size_continuous(range = c(1.5,8),guide=guide_legend(title = "loginvP",override.aes = list(stroke=0.25))) +
+  scale_x_discrete(expand = c(0,0.75)) +
+  scale_y_discrete(expand = c(0,0.75)) +
+  # facet_wrap(~chrom_state,ncol=1) +
+  labs(x="Cell specificity",
+       y="Enrichment, -log10 P",
+       title=paste0("Significantly enriched cell-specific regulatory elements\namong DA peaks (",0.1*100,"% FDR)"),
+       caption=paste0("Based on N=",paste(ntest,collapse = " and ")," test peaks in males and females, and N=",nbg," background peaks.")) +
+  theme_bw(base_size = 10) +
+  theme(aspect.ratio = 0.5,
+        strip.background = element_blank(),
+        strip.text.y = element_text(angle=0,hjust=0),
+        strip.text.x = element_text(size=10,hjust=0),
+        axis.text.x = element_text(angle=45,hjust=1),
+        panel.grid.major.y = element_blank(),
+        legend.box = "horizontal",
+        plot.caption = element_text(hjust=0,face = "italic",size = 6))
+ggsave(q,filename = "./Fig2/fig2_chromhmm_states.specificity_agebysex_enrichtest_focused.pdf")
+
+```
+
+```{r fig2e_logfc_dist, fig.asp=1}
+
+p <- ggplot(da.glm_agebysex %>% 
+              mutate(SexContrast=sub("\\_.*","",Contrast),
+                     direction=ifelse(logFC<0,"Closing peaks","Opening peaks")) %>%
+              inner_join(atac.allpeaks.anno.pbmc %>% 
+                           select(peakco,paste0("RE_specificity_",ctset)) %>%
+                           rename_all(funs(sub("RE_specificity.*","Specificity",.))) %>%
+                           filter(!is.na(Specificity)),
+                         by="peakco") %>% 
+              mutate(Specificity=ifelse(grepl("^B|Plasma",Specificity),"CD19",Specificity),
+                     Specificity=factor(ifelse(Specificity %in% c(focus.celltypes),Specificity,"Other")),
+                     direction=sub(" in$","",direction)) %>%
+              group_by(SexContrast,Specificity) %>%
+              mutate(n=n()) %>%
+              ungroup() %>%
+              mutate(Specificity=factor(Specificity,levels = c(focus.celltypes,"Other")),
+                     label=factor(paste0(Specificity,"\nn = ",n))) %>%
+              mutate(label=factor(label,levels = levels(label)[c(1,5,2,4,3,7,6,8)])) %>%
+              filter(Specificity!="Other"),
+            aes(label,logFC,fill=SexContrast,color=SexContrast)) +
+  geom_split_violin(draw_quantiles = 0.5,trim = F,alpha=0.5,size=0.25) +
+  geom_point(size=0.2,position=position_jitterdodge(dodge.width = -0.1,jitter.width = 0.05),alpha=0.25) +
+  stat_compare_means(aes(group=SexContrast), size=3, label.y = 2, label = "p.signif",vjust = 0) +
+  geom_hline(yintercept = 0,color="firebrick4",size=0.1,alpha=0.75,linetype=2) +
+  labs(y="logFC, HO-HY",
+       x=NULL,
+       title="Sex-specific logFC distribution of cell-specific regulatory elements",
+       caption="* P<0.01, ** P<0.001, ***P<0.0001") +
+  scale_fill_manual(values = colors_sex,guide=guide_legend(title = NULL)) +
+  scale_color_manual(values = colors_sex,guide=F) +
+  theme_bw(base_size = 11) +
+  theme(aspect.ratio = 0.6,
+        plot.title = element_text(hjust=0),
+        # axis.text.y = element_blank(),
+        strip.background = element_blank(),
+        strip.text.y = element_text(angle=0,hjust=0),
+        legend.position = "bottom",
+        legend.key.size = unit(0.5,"lines"),
+        panel.spacing = unit(0,"points"),
+        plot.caption = element_text(size=6,face="italic"))
+ggsave(p,filename = "./Fig2/FDR10/fig2_logfc.cellspecific_agebysex.pdf")
+
+```
+
+```{r fig2f_venn_atac, fig.asp=1}
+
+# Peak hits, list form
+da.glm_agebysex.do <- da.glm_agebysex %>% 
+  filter(FDR<=fdr.thresh) %>% 
+  inner_join(atac.allpeaks.anno.pbmc,by="peakco") %>%
+  split(.,f = .$Contrast)
+# da.glm_agebysex.do.closing <- da.glm_agebysex %>% 
+#   filter(FDR<=fdr.thresh,logFC<0) %>% 
+#   inner_join(atac.allpeaks.anno.pbmc,by="peakco") %>%
+#   split(.,f = .$Contrast)
+# da.glm_agebysex.do.opening <- da.glm_agebysex %>% 
+#   filter(FDR<=fdr.thresh,logFC>0) %>% 
+#   inner_join(atac.allpeaks.anno.pbmc,by="peakco") %>%
+#   split(.,f = .$Contrast)
+
+# Venn diagrams, peak-wise
+da.glm_venn_bypeak <- lapply(setNames(as.list(c("Females","Males")),c("Females","Males")), function(sx) {
+    allPeaks <- unique(sort(da.glm_agebysex.do[[paste(sx,"Age3xAge1",sep="_")]]$peakco))
+    dirPeaks <- lapply(setNames(as.list(c(1,-1)),c("opening","closing")), function(d) {
+      dirPeaks = unique(sort(subset(da.glm_agebysex.do[[paste(sx,"Age3xAge1",sep="_")]],sign(logFC)==d)$peakco))
+    })
+    return(list(all=allPeaks,opening=dirPeaks$opening,closing=dirPeaks$closing))
+  })
+peaksVenn_bypeak <- lapply(setNames(as.list(c("all","closing","opening")),c("all","closing","opening")), function(ds) {
+  v <- Venn(lapply(da.glm_venn_bypeak,`[[`,ds))
+  colnames(v@IndicatorWeight) <- sub("ales$",paste0("ales_",ds),colnames(v@IndicatorWeight))
+  return(v)
+})
+pdf("./Fig2/fig2_venn_peakwise_agebysex.pdf")
+  da.glm_venn_bypeak.plots <- sapply(da.glm_venn_bypeak,function(X) {
+    sapply(peaksVenn_bypeak, function(V) {
+      if (sum(V@IndicatorWeight[,3]>0)<=1) return(NULL)
+      plot(V)
+    })
+  })
+dev.off()
+
+# Venn diagrams, promoter-wise
+da.glm_venn_bytss <- lapply(setNames(as.list(c("Females","Males")),c("Females","Males")), function(sx) {
+  allPeaks <- unique(sort(subset(da.glm_agebysex.do[[paste(sx,"Age3xAge1",sep="_")]],abs(DistancetoTSS)<=pflank)$peakco))
+  dirPeaks <- lapply(setNames(as.list(c(1,-1)),c("opening","closing")), function(d) {
+    dirPeaks = unique(sort(subset(da.glm_agebysex.do[[paste(sx,"Age3xAge1",sep="_")]],sign(logFC)==d & abs(DistancetoTSS)<=pflank)$peakco))
+  })
+  return(list(all=allPeaks,opening=dirPeaks$opening,closing=dirPeaks$closing))
+})
+peaksVenn_bytss <- lapply(setNames(as.list(c("all","closing","opening")),c("all","closing","opening")), function(ds) {
+  v <- Venn(lapply(da.glm_venn_bytss,`[[`,ds))
+  colnames(v@IndicatorWeight) <- sub("ales$",paste0("ales_",ds),colnames(v@IndicatorWeight))
+  return(v)
+})
+pdf("./Fig2/fig2_venn_tsswise_agebysex.pdf")
+  da.glm_venn_bytss.plots <- sapply(da.glm_venn_bytss,function(X) {
+    sapply(X, function(V) {
+      if (sum(V@IndicatorWeight[,3]>0)<=1) return(NULL)
+      plot(V)
+    })
+  })
+dev.off()
+
+
+```
