@@ -6,5 +6,6 @@ The code can be found under seperate folders:
 1. FlowData: Code used for flow cytometry data analyses
 2. Scripts: Scripts for initial data analyses (e.g., differential analyses)
 3. Figures: Code used for figures related to genomic data analyses. 
+4. Shiny: Code used for R Shiny app.
 
 
