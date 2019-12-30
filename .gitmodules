@@ -1,0 +1,3 @@
+[submodule "Shiny/Ucar_Aging_Shiny"]
+	path = Shiny/Ucar_Aging_Shiny
+	url = https://github.com/TheJacksonLaboratory/Ucar_Aging_Shiny.git
